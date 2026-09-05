@@ -1,230 +1,572 @@
 # Multi-Agent Coding Stack — Orchestration Plan
 
-**Status:** Draft for review
-**Scope:** Codex + Google Antigravity + Hermes Agent (+ DeepSeek Harness, TBD) working on shared GitHub repos, posting to per-project Slack channels, and handing work off to each other.
+**Status:** Revised architecture plan
+**Scope:** Codex + Google Antigravity + Hermes Agent + DeepSeek Harness working across Sonoran Solutions repositories, with GitHub as the durable collaboration surface and Slack as the human-facing operations view.
+
+> The orchestrator is infrastructure for shipping Sonoran Solutions products. It is not itself the main product. Every automation layer must earn its complexity by reducing real work on an existing project.
 
 ---
 
 ## 1. Goal
 
-A small "team" of coding agents that:
+Build a small, auditable software-development "team" that can:
 
-1. **Post to a per-project Slack channel** whenever one of them changes code (human visibility).
-2. **Hand work to each other** through a durable, auditable record (GitHub), with a clear owner at every moment (no two agents editing the same files at once).
-3. **Keep builds green autonomously** — an always-on agent watches a build and fixes failures in a tight loop, escalating only when it's stuck.
+1. Turn a human goal into a scoped issue with explicit acceptance criteria.
+2. Hand tasks between specialized agents without sharing an unsafe mutable checkout.
+3. Implement, test, review, and repair code with clear ownership at every step.
+4. Keep humans informed through concise project-level Slack updates.
+5. Escalate product, API, architecture, or high-risk decisions instead of inventing behavior.
+6. Survive agent/provider changes because the coordination layer is vendor-neutral.
+
+### Non-goals
+
+- Do not build a general autonomous-company framework before one real project benefits from it.
+- Do not let public GitHub or Slack text directly become shell commands or trusted instructions.
+- Do not make one agent both the author and sole judge of whether its change is correct.
+- Do not auto-merge broad agent-authored changes during the initial rollout.
+- Do not add queues, services, dashboards, databases, or remote-access layers until the previous phase is useful in practice.
 
 ---
 
-## 2. The stack and role assignments
+## 2. Design principles
 
-This is the refined split you described, with an honest note on *why* each tool fits (and where to validate rather than assume).
+### 2.1 GitHub remains the durable record
 
-| Agent | Role | Strengths that justify the role | Notes / caveats |
+Issues, PRs, commits, checks, and structured handoff metadata are the long-lived record of what happened and why.
+
+### 2.2 The Sonoran router owns policy, not model reasoning
+
+The router should make deterministic decisions about authorization, task state, leases, retries, and dispatch. It should not depend on one model vendor to remember which task is active.
+
+### 2.3 SQLite provides small, durable orchestration state
+
+GitHub remains the human/audit record, but a local SQLite database should track runtime facts such as delivery deduplication, active leases, attempt counts, timestamps, and task state. This prevents a process restart or duplicate webhook from creating duplicate workers.
+
+### 2.4 Every task gets an isolated worktree
+
+Branch ownership is necessary but not sufficient. Each active task gets its own git worktree so two agents cannot mutate the same working directory.
+
+### 2.5 GitHub Actions is the independent green/red judge
+
+Workers may run the same canonical build command locally, but GitHub Actions is the final independent verifier. An agent that authored a fix does not get to declare its own change trusted merely because its local command passed.
+
+### 2.6 Humans retain product authority
+
+Agents can handle routine implementation and mechanical fixes. Product direction, architecture changes, schema/API changes, security-sensitive work, and early merge decisions remain human-controlled.
+
+### 2.7 Slack is an operations dashboard, not the database
+
+Slack should surface meaningful state transitions and exceptions. Detailed history belongs in GitHub and the orchestration log.
+
+---
+
+## 3. Roles and authority
+
+| Role | Tool | Primary job | Initial authority |
 |---|---|---|---|
-| **Codex** | **Planner + Debugger/Bugfixer** | Strong at decomposing specs into tasks, reasoning about a failing system, and producing fixes. `codex exec` gives a headless entry point; hooks.json fires on tool events. | Don't also make it do bulk codegen — keep it off the critical path so it's free for reasoning. |
-| **Google Antigravity** | **Implementer ("grunt" work)** | IDE-native bulk edits, scaffolding, project-wide context, MCP connections ([docs/mcp](https://antigravity.google/docs/mcp)); has an SDK and CLI for scripted driving. | Validate the *autonomous* path: if you drive it through the IDE by hand it can't take unattended handoffs. Confirm the [SDK](https://antigravity.google/docs/sdk/mcp) / CLI can run headless before promising full automation. |
-| **Hermes Agent** (Nous Research) | **Build Herald — live build/test debugging** | Open-source, self-hosted, always-on; native [Slack](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack/), cron scheduling + HTTP triggers, GitHub workflows, MCP, persistent memory; runs a local model (e.g. Hermes 4) for zero API cost. | This is the piece that makes "live debugging while running a build" real — see §6. |
-| **DeepSeek Harness** | **TBD — recommended: Orchestrator / Hub** | Already has subagents, multi-agent workflows, an MCP *client*, inbound GitHub-webhook → new-session adapter, headless mode, and runs local *and* API models. | You're still evaluating it. Two ways it fits: as the router that receives events and dispatches to the others (§5.3), or as the in-house multi-agent debugging layer. |
-| **Human** | **Goal-setter + merge gate** | Final review and merge approval; owns the Slack channels. | Agents should be *able* to escalate to you, never required to wait on you for routine merges. |
+| **Product manager / planner** | **Codex** | Turn a human goal or bug report into a scoped task, acceptance criteria, implementation notes, and risks. | May create/update planning artifacts. No automatic merge authority. |
+| **Primary implementer** | **Google Antigravity** | Bulk implementation, scaffolding, project-wide edits, UI/application work. | **Human-steered initially.** Automated/headless use is a later upgrade only after the handoff and safety model is proven. |
+| **CI repair technician** | **Hermes Agent** | Diagnose build/test failures and attempt small mechanical repairs in a bounded loop. | May edit only the assigned task worktree and only within explicit repair limits. |
+| **Reviewer / hard debugger** | **Codex** | Review agent-authored changes, investigate hard failures, reason about cross-cutting bugs. | May recommend approval/rejection and author fixes; still subject to CI and merge policy. |
+| **Specialist swarm / research layer** | **DeepSeek Harness** | Spawn parallel debugging, research, test, or analysis subagents when a task benefits from breadth. | Worker capability only at first; **not the source of truth for task state or routing policy.** |
+| **Dispatcher / policy engine** | **Sonoran router** | Validate events, authorize tasks, maintain state/leases, create dispatches, enforce limits. | Deterministic control plane. No model reasoning required for routine routing. |
+| **Independent validator** | **GitHub Actions** | Run the canonical CI contract and produce authoritative required checks. | Green/red gate only. |
+| **Product owner** | **Human** | Set goals, decide product/architecture tradeoffs, approve higher-risk merges, stop/retry workflows. | Final authority. |
 
-**Principle:** keep each tool in its lane, and let a *neutral bus* (GitHub + Slack + webhooks) carry work between them — no single vendor is the hub. This is what makes it survive you swapping DeepSeek, Hermes, or Codex in/out.
-
----
-
-## 3. The coordination substrate
-
-Three layers, each with one job:
-
-1. **GitHub = the durable record and handoff medium.** Issues and PRs are the machine-readable conversation. Branch ownership = "who is allowed to touch these files right now."
-2. **Slack = the human view and control plane.** One channel per project. Agents post *events* (started, changed, failed, escalated, done); humans post *steering* (stop, redo, approve).
-3. **Webhooks = the wake-up mechanism.** A push/issue/PR/comment event wakes the next agent in the chain. (DeepSeek Harness ships a GitHub webhook adapter; Hermes has HTTP triggers; Codex/Antigravity can be started from a small relay.)
-
-```
-        ┌─────────────── GitHub ───────────────┐
-        │  issues · PRs · branches · webhooks  │
-        └───────┬───────────────┬──────────────┘
-                │               │
-   ┌────────────▼───┐   ┌───────▼────────────┐
-   │  Codex (plan/  │   │  Antigravity       │
-   │  debug)        │   │  (implement)       │
-   └────────┬───────┘   └────────┬───────────┘
-            │                     │
-        ┌───▼─────────────────────▼───┐
-        │  Hermes Agent (build herald) │──▶ Slack (per-project channel)
-        └──────────────┬───────────────┘
-                       │ escalate
-        ┌──────────────▼───────────────┐
-        │  DeepSeek Harness (router /  │
-        │  multi-agent debug, TBD)     │
-        └──────────────────────────────┘
-```
+**Principle:** agents are replaceable workers; GitHub + router state + CI define the process.
 
 ---
 
-## 4. Ownership and turn-taking (the part that stops chaos)
+## 4. Coordination substrate
 
-Multiple agents editing one checkout = merge conflicts and clobbered work. Rules:
+The stack has five layers:
 
-1. **Branch ownership.** Exactly one agent owns a branch at a time:
-   - `feat/<issue-id>` — Antigravity (implementation).
-   - `fix/<issue-id>` — Codex (debugging) or Hermes (build hotfix).
-   - `plan/<issue-id>` — Codex writes specs, not code.
-2. **Handoff only through artifacts, never through the working tree.** An agent "passes the baton" by committing, pushing, and writing/updating an issue/PR with a structured block (below). The next agent starts from that commit.
-3. **One commit-owner per branch.** Hermes may *only* commit build/test fixes onto the branch it's watching; if the fix needs design reasoning, it escalates to Codex instead of guessing.
-4. **Merge gate.** A PR is merged only after the build is green and (for non-trivial changes) a human or Codex approves. Hermes reports green/red on every PR; this is the "build is healthy" signal everyone trusts.
+1. **GitHub — durable work record**
+   - Issues and PRs contain the task narrative and handoff envelope.
+   - Commits contain actual code changes.
+   - Actions/checks provide independent validation.
 
-### Handoff envelope (the structured block agents write)
+2. **SQLite — runtime orchestration state**
+   - Task/run IDs.
+   - GitHub delivery IDs for deduplication.
+   - Current agent and state.
+   - Base SHA and branch/worktree lease.
+   - Attempt counts, timestamps, and last error.
+
+3. **Git worktrees — execution isolation**
+   - One worktree per active task/agent lease.
+   - Never let unrelated workers share a mutable checkout.
+
+4. **Slack — human operations view**
+   - Project channels show meaningful transitions.
+   - A future `#agent-ops` channel shows orchestration failures and system-wide alerts.
+   - Slack commands can become a control surface later, but GitHub/SQLite remain authoritative.
+
+5. **Webhooks/events — wake-up mechanism**
+   - GitHub events wake the router or a narrowly scoped worker.
+   - Every event is authenticated, deduplicated, authorized, and mapped to a known task before code execution.
+
+```text
+                    ┌──────────── GitHub ─────────────┐
+                    │ issues · PRs · commits · CI     │
+                    └──────────────┬──────────────────┘
+                                   │ signed events
+                                   ▼
+                    ┌─────────────────────────────────┐
+                    │ Sonoran router + SQLite state   │
+                    │ auth · leases · limits · route │
+                    └───────┬─────────┬─────────┬─────┘
+                            │         │         │
+                         Codex   Antigravity  Hermes
+                            │         │         │
+                            └────┬────┴────┬────┘
+                                 │ worktrees
+                                 ▼
+                         GitHub PR / Actions
+                                 │
+                    ┌────────────┴────────────┐
+                    │                         │
+                  Slack                 Human gate
+              project/ops view          when required
+
+DeepSeek Harness is available to workers as a specialist swarm/debug layer,
+not as the sole owner of orchestration state.
+```
+
+---
+
+## 5. Task lifecycle
+
+The router should eventually enforce a small explicit state machine rather than infer everything from free-form messages.
+
+Recommended states:
+
+```text
+planned
+  ↓
+authorized
+  ↓
+assigned
+  ↓
+in_progress
+  ↓
+review
+  ↓
+verification
+  ↓
+done
+
+Any active state may instead become:
+blocked → escalated → assigned/review/done
+```
+
+### Required transition rules
+
+- `planned -> authorized` requires a trusted authorization signal.
+- `authorized -> assigned` creates or confirms the task branch/worktree lease.
+- Only the current lease holder may move `assigned -> in_progress`.
+- `review -> verification` requires a PR/commit SHA to exist.
+- `verification -> done` requires configured required checks to be green and the merge policy to be satisfied.
+- A task exceeding attempt/time limits becomes `blocked` or `escalated`; it does not loop indefinitely.
+
+---
+
+## 6. Handoff envelope
+
+The handoff block remains the portable GitHub representation of task state, but it should be versioned and explicit enough for deterministic parsing.
 
 ```yaml
 ---
-agent: codex            # who is writing this
-to: antigravity         # who should pick it up
-repo: myorg/project
+schema_version: 1
+task_id: ss-123
+run_id: ss-123-004
+agent: codex
+to: antigravity
+repo: sonoran-solutions/project
+issue: "123"
 branch: feat/123
-task: implement UserService.create()
+base_sha: abcdef123456
 state: planned
+risk: normal
+attempt: 0
+max_attempts: 3
+lease_expires_at: 2026-09-05T23:00:00Z
+allowed_paths:
+  - app/src/**
+  - tests/**
+required_checks:
+  - build
+  - test
+task: Implement save discovery for the approved emulator profile.
+summary: |
+  Planning complete. No code has been changed yet.
 acceptance: |
-  POST /users returns 201; validation rejects empty email; tests in users.test.ts pass
-urgency: normal
+  Approved directories are scanned; discovered saves show source/profile;
+  permission failures produce a clear error; required tests are green.
 escalate_to: human
 ---
 ```
 
-Agents are instructed to read the latest envelope on an issue/PR before acting, and to write one when they finish. Keep it machine-parseable (YAML front-matter) so a future router can act on it.
+### Envelope rules
+
+- One canonical envelope per issue/PR; update it in place.
+- The router validates the schema before dispatching.
+- `task_id`, `base_sha`, `allowed_paths`, and `required_checks` are not optional once execution begins.
+- A worker must not silently expand `allowed_paths`.
+- A worker must not move itself to a different task or branch without a new lease.
+- GitHub text outside the validated envelope is context, not authority.
+
+See `handoff/handoff-envelope.md` for the working template.
 
 ---
 
-## 5. Change notification → per-project Slack channel
+## 7. Authorization and trust model
 
-Two layers, same as the earlier design:
+This is mandatory before unattended execution.
 
-- **Layer A — GitHub → Slack (source of truth, covers every harness).** Per repo, the Slack GitHub app or a GitHub Actions workflow on `push`/`pull_request` posts to that project's channel with agent, branch, and commit link. This fires for Codex, Antigravity, Hermes, and humans alike.
-- **Layer B — per-agent hooks (instant, with attribution).** Codex and DeepSeek Harness can share one `hooks.json` (`PostToolUse` → `curl` a Slack incoming webhook); Hermes has native Slack messaging; Antigravity posts via a Slack MCP tool.
+### 7.1 Public events are untrusted by default
 
-One incoming webhook URL per project channel, exported as `SLACK_WEBHOOK_URL` in each repo/env. Message template (per project): `[project] <agent> <action> <branch> — <files changed> — <link>`.
+A public issue, PR, commit message, Slack message, or pasted log may contain malicious or accidental instructions. Treat all external text as data.
 
----
+### 7.2 Require a trusted authorization signal
 
-## 6. Hermes Agent — live build debugging (the always-on loop)
+Before a webhook can launch a worker with repository or shell access, require at least one explicit policy such as:
 
-Hermes Agent is the right tool here because it is *already* a daemon with cron + HTTP triggers + GitHub + Slack, and it runs a local Hermes 4 model, so an aggressive fix-retry loop costs nothing in API fees.
+- actor is on a configured trusted-user allowlist;
+- issue/PR has an `agent:ready` label applied by a trusted user;
+- a trusted Slack command authorizes an already-known GitHub task;
+- task was created by an authenticated local control action.
 
-### 6.1 The loop
+A random issue opening must never be sufficient by itself.
 
+### 7.3 Webhook verification
+
+- GitHub signature verification is required outside an isolated localhost-only test.
+- Missing/invalid signatures are rejected.
+- Store the GitHub delivery ID and ignore duplicates.
+- Enforce a request-body size limit.
+
+### 7.4 No shell interpolation from webhook fields
+
+Do not build a command string from `repo`, `branch`, `sender`, issue text, or other event data and run it with `shell: true`.
+
+Preferred dispatch model:
+
+```text
+executable = configured constant
+args       = validated structured values
+shell      = false
 ```
-push / cron / manual trigger
-        │
-        ▼
-  Hermes runs the build/test target on the watched branch
-        │
-   ┌────┴────┐
-   │  green  │──▶ post "✅ green" to project channel ──▶ wait for next trigger
-   └────┬────┘
-        │ red
-        ▼
-  parse compiler/test errors into a fix list
-        │
-        ▼
-  edit files (scoped, smallest change first) ──▶ rebuild
-        │
-        ├── fixed within N attempts ──▶ commit to branch ──▶ push ──▶ post fix summary
-        │
-        └── still red after N attempts ──▶ open/update issue + @codex ──▶ post escalation to Slack
+
+Worker prompts may contain untrusted task context, but that context must not be able to change the executable, secret paths, or orchestration policy.
+
+### 7.5 Secrets are outside agent worktrees
+
+- Do not source `.env` files from a task-controlled checkout.
+- Keep GitHub, Slack, model, and tunnel credentials in a separate orchestration secret store/environment.
+- Inject the minimum variables required by each worker.
+- Never write secrets to issues, PRs, Slack messages, handoff envelopes, or dispatch logs.
+
+---
+
+## 8. Branch, worktree, and lease model
+
+### Branch conventions
+
+- `feat/<issue-id>` — feature implementation.
+- `fix/<issue-id>` — debugging/repair.
+- `plan/<issue-id>` — optional planning-only branch when a document change is needed.
+
+### Worktree conventions
+
+Example local layout:
+
+```text
+/worktrees/
+  dualdex/
+    issue-123-antigravity/
+    issue-141-codex/
+  savebridge/
+    issue-22-hermes/
 ```
 
-### 6.2 Trigger modes
+### Lease requirements
 
-- **Event-driven (preferred):** GitHub webhook on `push`/`pull_request` hits a Hermes HTTP trigger (or a tiny relay), which starts a build pass.
-- **Cron fallback:** a Hermes cron job polls the watched branch every few minutes so a stuck/hung build is never silently left red.
+Each active lease records:
 
-### 6.3 Guardrails (this is what makes "live" safe instead of dangerous)
+- task ID;
+- assigned agent;
+- repo/branch;
+- base SHA;
+- worktree path;
+- lease creation/expiry;
+- allowed paths;
+- current attempt.
 
-- **Bounded retries:** max N fix attempts per failure (e.g. 5), then escalate — no infinite edit loops.
-- **Revert-on-regression:** if a "fix" makes more tests fail, revert that commit and try the next hypothesis.
-- **Scoped commits:** one commit per build failure, message links the failing test/line, so a human can `git revert` one step.
-- **No design decisions:** if the fix requires changing a public API, a schema, or a spec, Hermes escalates to Codex rather than inventing behavior.
-- **Deterministic build target:** everything runs through a single scripted command (e.g. `./ci.sh build` / `./ci.sh test`) so every agent sees the same green/red definition.
+Before committing or pushing, a worker verifies that:
 
-### 6.4 Where it runs
+1. its lease is still valid;
+2. the branch/base state has not moved unexpectedly;
+3. the changes remain within allowed scope.
 
-Self-host on your existing box (you already run Ollama + LM Studio). Hermes supports local models via [Ollama](https://hermes-agent.nousresearch.com/docs/guides/local-ollama-setup) or its [built-in local runtime](https://hermes-agent.nousresearch.com/docs/user-guide/local-models). Use Hermes 4 (35B A3B or 70B depending on GPU) for the fix loop; fall back to a hosted model for harder debugging.
-
----
-
-## 7. Escalation ladder
-
-1. **Hermes** fixes build/test failures in-loop.
-2. Still red after N attempts, or the fix needs design → **Codex** takes over as debugger (on a `fix/` branch).
-3. Still stuck, or a product/API decision is needed → **human**, with the full trail (issue + Hermes attempts + Codex analysis) already in the issue thread.
-
-Each rung posts to the project's Slack channel with the handoff link, so you can watch or intervene at any rung.
+If any check fails, stop and escalate instead of guessing.
 
 ---
 
-## 8. End-to-end scenarios
+## 9. CI and build-repair model
 
-**A. Feature, spec → merged PR (Antigravity human-steered)**
-1. Human or Codex writes a spec + acceptance into issue #123; Codex posts `to: antigravity`.
-2. The router posts "ready for implementation" to the project's Slack channel (and previews the envelope).
-3. A human opens the **interactive Antigravity app** on `feat/123` and runs the implementation (this is the human-directed step).
-4. Antigravity pushes; GitHub→Slack posts "implemented"; push event wakes Hermes.
-5. Hermes builds/tests; on green, posts ✅ and marks the PR ready.
-6. Codex reviews + approves; human merges.
+Each participating repository defines one canonical CI contract, for example:
 
-**B. Build breaks, Hermes fixes it**
-1. Any commit breaks `./ci.sh test`; push event wakes Hermes.
-2. Hermes loops up to 5 fixes, commits each scoped change, pushes.
-3. Green → posts "✅ fixed — see PR"; done. No human involved.
+```bash
+./ci.sh build
+./ci.sh test
+```
 
-**C. Hard bug, Hermes escalates to Codex**
-1. Hermes can't fix within 5 attempts → opens `fix/<issue>` with its attempts + failing test; `@codex` in the issue; Slack escalation post.
-2. Codex debugs on `fix/` branch, opens a PR with the real fix + explanation.
-3. Hermes verifies the PR branch is green; Codex approves; human merges.
+Local workers and GitHub Actions call the same underlying commands whenever practical.
+
+### Hermes loop
+
+1. Receive an authorized task/CI failure.
+2. Create/use its assigned worktree and lease.
+3. Run the canonical command.
+4. If green, report the result and stop.
+5. If red, identify a small mechanical hypothesis.
+6. Patch only the failing area within `allowed_paths`.
+7. Re-run locally.
+8. If improved, commit/push and wait for GitHub Actions.
+9. If GitHub Actions is green, hand off to review/merge policy.
+10. If the fix regresses the branch, revert the attempt.
+11. After the configured limit, escalate to Codex/human and stop.
+
+### Hermes may not decide
+
+- public API changes;
+- schema/data migration behavior;
+- product semantics;
+- security policy;
+- broad test deletion/weakening;
+- architecture rewrites.
+
+### Independent validation
+
+Hermes saying "green" is useful telemetry; the required GitHub Actions check is the authoritative signal.
 
 ---
 
-## 9. Decisions & open items
+## 10. Review and merge policy
 
-**Locked in (as of this conversation):**
+### Initial policy
 
-1. **Antigravity = interactive app, human-steered.** You're using the current Antigravity application (not the IDE). Consequence: *implementation is not an automated hop.* The router can hand off a scoped task and post "ready for implementation," but a human runs the Antigravity app to execute it. Autonomous edges are covered by Codex + Hermes; Antigravity stays in the loop as the human-directed implementer. (Revisit only if you later drive Antigravity via its SDK/CLI.)
-2. **DeepSeek Harness = both router/hub *and* in-house debug layer.** It receives GitHub/Slack events, dispatches to the others, and hosts the multi-agent debugging workflows.
-3. **Merge policy.** Auto-merge build-only fixes (Hermes/Codex); human approval gate on features (via branch protection / review).
-4. **Single machine.** Everything self-hosted on your box. Keep all secrets (webhooks, tokens) in one env/secret store.
-5. **Remote access = future nice-to-have.** Later, expose the router/hub HTTP API (or the DeepSeek web UI) through a private tunnel (e.g. Cloudflare Tunnel / Tailscale) so you can trigger or watch the workflow from other devices. Not needed for the initial build.
+**No unattended agent-authored merges.**
 
-**Still open (project-specific):**
+Recommended early flow:
 
-- **Canonical build command.** Each repo needs a single `./ci.sh <build|test>` (or equivalent) that all agents run. This is the shared "ground truth" the whole loop depends on — define it per repo in the first milestone (M0/M1).
+- Antigravity implementation → Codex review → GitHub Actions → human merge.
+- Hermes fix → Codex review → GitHub Actions → human merge.
+- Codex fix → GitHub Actions → human review/merge.
+
+This intentionally creates a small amount of friction while the system earns trust.
+
+### Future low-risk auto-merge
+
+Only consider auto-merge after a substantial successful history, and only for a narrow documented class of changes with all of the following:
+
+- low risk classification;
+- no API/schema/security/product behavior change;
+- required CI checks green;
+- change scope within explicitly allowed paths;
+- reviewer policy satisfied;
+- no weakened/deleted required tests;
+- no dependency/security-sensitive change unless separately approved.
 
 ---
 
-## 10. Risks and mitigations
+## 11. Slack design
+
+Organize Slack around **projects**, not fake employee departments.
+
+Recommended structure:
+
+- `#dual-dex` — DualDex project activity.
+- `#savebridge` — SaveBridge project activity.
+- `#dungeon-dispatcher` — game project activity when development begins.
+- `#agent-ops` — system-wide failures: dead workers, auth failures, queue/lease problems, provider outages.
+- existing general/social channels remain human spaces.
+
+### Default project-channel events
+
+Post only meaningful transitions:
+
+- ▶️ task started / assigned;
+- 🧪 PR ready for verification;
+- 🚨 CI failure or escalation requiring attention;
+- ✅ completed/merged;
+- ⛔ stopped/blocked.
+
+Do **not** post every file edit, tool call, compiler invocation, or retry to the channel by default. Detailed execution history belongs in logs/GitHub. If a task needs discussion, keep it in one Slack thread tied to the GitHub issue/PR.
+
+### Slack as a control surface
+
+Incoming webhooks are sufficient for early outbound notifications. A real Slack app/bot can be added later for authenticated commands such as:
+
+- `stop <task>`
+- `retry <task>`
+- `status <task>`
+- `approve <task>`
+
+Those commands must map to router state transitions; Slack itself is not the authoritative task database.
+
+---
+
+## 12. DeepSeek Harness placement
+
+DeepSeek Harness is useful for multi-agent debugging/research and may eventually host richer routing workflows, but the initial architecture should not depend on it as the sole orchestration hub.
+
+Use it initially for tasks such as:
+
+- parallel root-cause hypotheses;
+- codebase research;
+- test-generation proposals;
+- implementation/review subagents;
+- comparing multiple debugging strategies.
+
+The Sonoran router still owns authorization, state, leases, retry counts, and dispatch policy. This keeps the orchestration layer stable even if DeepSeek Harness changes or is replaced.
+
+---
+
+## 13. End-to-end scenarios
+
+### A. Feature: goal → PR
+
+1. Human creates/approves an issue.
+2. Codex turns it into a scoped envelope with acceptance criteria.
+3. Human applies/approves the authorization signal (`agent:ready` initially).
+4. Router creates the task record, branch/worktree lease, and assigns Antigravity.
+5. Human drives Antigravity during the early rollout.
+6. Antigravity commits/pushes and opens/updates the PR.
+7. Codex reviews the diff against acceptance criteria.
+8. GitHub Actions runs the canonical CI contract.
+9. Human merges when review + required checks are satisfied.
+10. Router marks the task done and Slack receives one concise completion message.
+
+### B. Mechanical CI failure: Hermes repair
+
+1. GitHub Actions reports a failure on an authorized task PR.
+2. Router assigns a Hermes repair lease for the affected task/worktree.
+3. Hermes tries the smallest mechanical fix within scope.
+4. Hermes commits/pushes the candidate repair.
+5. GitHub Actions independently verifies it.
+6. Codex reviews the repair.
+7. Human merges during the initial policy period.
+
+### C. Hard failure: escalation
+
+1. Hermes reaches the attempt limit or detects a design/API/schema decision.
+2. Router changes the task to `blocked/escalated`.
+3. Hermes updates the handoff envelope with attempts and evidence.
+4. Codex receives a new debugging lease.
+5. If Codex cannot resolve it without a product decision, the task escalates to the human with the full GitHub trail already attached.
+
+---
+
+## 14. Current implementation gaps to fix before unattended use
+
+The existing scaffolding demonstrates the intended flow, but it is not yet a production-safe control plane.
+
+### Router
+
+- Replace shell-string dispatch with executable + argument-array dispatch (`shell: false`).
+- Parse and validate the handoff envelope instead of routing based only on generic webhook event/action fields.
+- Add task IDs and correct issue/PR identifiers to the event context.
+- Reject missing webhook signatures outside explicit local-dev mode.
+- Add body-size limits, execution timeouts, concurrency limits, and cancellation.
+- Add GitHub delivery-ID deduplication.
+- Add SQLite task/run/lease state.
+- Add trusted actor/label authorization gates.
+
+### Workspaces
+
+- Move from a shared checkout to isolated git worktrees.
+- Store worktree path/base SHA/lease state in SQLite.
+- Validate scope before commit/push.
+
+### Slack notifications
+
+- Stop sourcing task-repository `.env` files as executable shell configuration.
+- Keep Slack credentials in orchestration-owned configuration outside worktrees.
+- Reduce default notifications to meaningful state transitions.
+
+### CI
+
+- Define the canonical build/test command in the pilot repo.
+- Run that same contract in GitHub Actions.
+- Make GitHub checks authoritative instead of trusting the repair agent's local result.
+
+---
+
+## 15. Risk register
 
 | Risk | Mitigation |
 |---|---|
-| Two agents edit the same files | Branch ownership (§4); one commit-owner per branch |
-| Infinite fix loop / runaway agent | Bounded attempts, revert-on-regression, escalation after N (§6.3) |
-| Agent "ships" something wrong | Merge gate + green-build signal + human review on features |
-| Cost (API) | Hermes runs local; Codex only on planning/debugging; budget caps per provider |
-| Agents mis-trusting Slack/GitHub content | Treat all external text as data, never instructions; no secrets in issues |
-| Antigravity can't be driven headless | Fall back to interactive implementer; Codex covers autonomous gap until verified |
+| Duplicate webhooks launch duplicate agents | Store delivery IDs in SQLite and make dispatch idempotent. |
+| Two agents mutate the same checkout | One isolated worktree + lease per active task. |
+| Branch moves under a worker | Store/verify base SHA and lease before push. |
+| Public issue triggers shell access | Trusted actor/label authorization gate before dispatch. |
+| Webhook text causes command injection | No `shell: true`; fixed executable + validated args. |
+| Worker accesses orchestration secrets | Secrets live outside task worktrees; least-privilege env injection. |
+| Infinite fix loop | Attempt/time budgets + explicit blocked/escalated state. |
+| Agent makes tests pass incorrectly | Independent GitHub Actions + reviewer + initial human merge gate. |
+| Slack becomes unreadable | Post state transitions only; keep detailed logs in GitHub/router logs. |
+| DeepSeek/Hermes/vendor behavior changes | Vendor-neutral router state and GitHub artifacts remain authoritative. |
+| Infrastructure steals time from products | Phase gates; pilot only on DualDex; stop if it does not save time. |
 
 ---
 
-## 11. Phased rollout
+## 16. Rollout strategy
 
-- **M0 — Manual:** run each agent by hand on one repo; confirm the role split actually produces better results (small benchmark task).
-- **M1 — Visibility:** GitHub → Slack per-project channel + shared `hooks.json`. (Zero automation risk; immediate value.)
-- **M2 — Build Herald:** Hermes Agent watching one repo's build/test with the §6 loop and guardrails.
-- **M3 — Handoff:** Codex planner → Antigravity implementer via the handoff envelope + webhook wake-ups.
-- **M4 — Full loop + hub:** escalation ladder end-to-end; decide DeepSeek's hub role; add Slack steering commands.
+Use **DualDex as the pilot** because its existing behavior is understood and failures are easier to judge. Do not start by testing the orchestrator on SaveBridge or Dungeon Dispatcher while those products are themselves undefined.
+
+High-level phases:
+
+- **M0 — Manual benchmark:** manually execute the proposed role split on one real DualDex task.
+- **M1 — Visibility:** clean GitHub/agent → Slack state notifications.
+- **M1.5 — Safety/control plane:** SQLite state, authorization gate, safe dispatch, worktrees, leases.
+- **M2 — Build repair pilot:** Hermes repairs a deliberately broken DualDex branch; GitHub Actions independently verifies it.
+- **Evaluation gate:** decide whether the stack is actually saving time.
+- **M3 — Structured handoffs:** automate Codex → implementer → review/CI transitions.
+- **M4 — Operations layer:** authenticated Slack controls, richer DeepSeek specialist workflows, optional remote access.
+
+The detailed checklist, acceptance criteria, and suggested task order live in [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md).
 
 ---
 
-## 12. References
+## 17. Definition of success
+
+The orchestrator succeeds when it makes shipping Sonoran Solutions software **faster and safer than working manually**.
+
+A successful first version should be able to take one well-scoped DualDex issue through:
+
+```text
+human goal
+→ Codex plan
+→ authorized task
+→ isolated implementation worktree
+→ PR
+→ independent CI
+→ review
+→ human merge
+→ concise Slack completion
+```
+
+and handle at least one deliberately introduced CI failure through a bounded Hermes repair/escalation flow.
+
+If maintaining the orchestration infrastructure takes more time than it saves, stop expanding it and return effort to SaveBridge / Dungeon Dispatcher.
+
+---
+
+## 18. References
 
 - Hermes Agent: [docs](https://hermes-agent.nousresearch.com/docs/), [Slack](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack/), [local models](https://hermes-agent.nousresearch.com/docs/user-guide/local-models), [Ollama setup](https://hermes-agent.nousresearch.com/docs/guides/local-ollama-setup), [GitHub repo](https://github.com/nousresearch/hermes-agent)
-- Antigravity: [MCP](https://antigravity.google/docs/mcp), [SDK MCP](https://antigravity.google/docs/sdk/mcp), [Google Workspace MCP codelab (2.0/IDE/CLI)](https://codelabs.developers.google.com/google-workspace-mcp-antigravity)
+- Antigravity: [MCP](https://antigravity.google/docs/mcp), [SDK MCP](https://antigravity.google/docs/sdk/mcp), [Google Workspace MCP codelab](https://codelabs.developers.google.com/google-workspace-mcp-antigravity)
 - Codex: [hooks doc](https://github.com/openai/codex/blob/main/docs/hooks.md)
-- DeepSeek Harness: [repo](https://github.com/deepseek-ai/deepseek-harness) (subagents, workflows, MCP client, GitHub-webhook adapter, headless mode — verified in the installed packages)
+- DeepSeek Harness: [repo](https://github.com/deepseek-ai/deepseek-harness)
