@@ -1,81 +1,126 @@
-# Agent stack — working artifacts
+# Sonoran Solutions Orchestrator
 
-A concrete starter kit for a multi-agent coding stack. All four artifacts below
-share one design (see [`AGENT_ORCHESTRATION_PLAN.md`](AGENT_ORCHESTRATION_PLAN.md))
-and the decisions you've made so far.
+A concrete starter kit for a small multi-agent software-development workflow used across Sonoran Solutions projects.
 
-## The stack
+The goal is **not** to build an autonomous fake company for its own sake. The goal is to make real product work — starting with DualDex — easier to plan, implement, test, review, and monitor.
 
-| Agent | Role |
+## Current architecture
+
+| Component | Role |
 |---|---|
-| Codex | Planner + Debugger/bug fixer |
-| Google Antigravity (interactive app) | Implementer — **human-steered** |
-| Hermes Agent (Nous) | Build herald — live build/test debugging, always-on |
-| DeepSeek Harness | Router/hub **and** in-house multi-agent debug layer |
+| **Codex** | Planner, reviewer, debugger/bug fixer |
+| **Google Antigravity** | Primary implementer; human-steered during the initial rollout |
+| **Hermes Agent** | CI/build repair technician with bounded attempts |
+| **DeepSeek Harness** | Optional specialist swarm / multi-agent debug layer |
+| **Sonoran router** | Deterministic authorization, state, lease, and dispatch policy |
+| **SQLite** | Durable runtime task/run/delivery/lease state |
+| **Git worktrees** | One isolated mutable checkout per active task |
+| **GitHub Actions** | Independent required-check authority |
+| **Slack** | Human-facing project/operations view |
+| **Human** | Product authority and initial merge gate |
 
-**Neutral bus:** GitHub (durable record + handoff) · Slack (per-project channel,
-human view) · webhooks (wake-ups). No single vendor is the hub.
+**Neutral bus:** GitHub remains the durable work record. The router owns runtime policy/state. No model vendor is the source of truth.
 
-## The artifacts
+## Core safety rules
 
-| Folder | What it is | Milestone |
-|---|---|---|
-| `slack-notify/` | Post change events to a project channel. `hooks.json` + script for Codex/DSH; GitHub Actions backstop for everyone. | **M1** — visibility |
-| `handoff/` | The envelope template + ownership/turn-taking rules agents follow. | M1–M3 |
-| `hermes-watch/` | `fix-build` skill + trigger config for the always-on build debugger. | **M2** — build herald |
-| `router/` | Dependency-free GitHub webhook → agent wake-up relay (DSH hub path). | **M3** — handoff |
+1. **Public GitHub/Slack text is untrusted data.** A random issue must never be enough to launch a local worker.
+2. **Every unattended task requires an explicit trusted authorization signal** such as an allowlisted actor or trusted `agent:ready` label.
+3. **No webhook-derived shell strings.** Worker executables are fixed configuration and structured arguments are dispatched with `shell: false`.
+4. **One task = one worktree + lease.** Agents do not share a mutable checkout.
+5. **GitHub Actions is the independent green/red judge.** Workers may test locally, but they do not self-certify correctness.
+6. **No unattended agent-authored merges during the pilot.** CI + review + human merge until the system earns more trust.
+7. **Secrets live outside task worktrees.** Never source task-controlled `.env` files as orchestrator configuration.
+8. **Bound every loop.** Attempts, runtime, concurrency, and retries must have hard limits and escalation behavior.
 
-## Quickstart
+## Repository layout
 
-**M1 — visibility (do this first, zero risk)**
-1. Create a Slack incoming webhook per project channel → copy into `.env`
-   (see `slack-notify/.env.example`).
-2. Copy `slack-notify/` into each repo as `.agent-stack/`, set the webhook.
-3. Test: `DRY_RUN=1 .agent-stack/slack-notify.sh test`, then real `test`.
-4. Point Codex at `hooks.json` (and mount it in DSH via
-   `@deepseek-ai/dsh-hooks-codex`).
-5. Add `slack-notify/workflows/slack-notify.yml` to `.github/workflows/` +
-   the `SLACK_WEBHOOK_URL` secret → every agent/human push is reported.
+| Path | Purpose |
+|---|---|
+| [`AGENT_ORCHESTRATION_PLAN.md`](AGENT_ORCHESTRATION_PLAN.md) | Full architecture, authority model, trust boundaries, state machine, CI/review flow, and rollout strategy |
+| [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) | Phased project checklist from manual DualDex pilot through safe automation |
+| `handoff/` | Versioned machine-readable handoff envelope and task-state rules |
+| `slack-notify/` | Early notification helpers; should evolve toward state-transition notifications rather than tool-call spam |
+| `hermes-watch/` | Hermes repair skill/scaffolding; must be integrated with task scope, worktrees, leases, and independent CI before unattended use |
+| `router/` | Prototype webhook relay/control-plane scaffolding; **not yet production-safe** |
 
-**M2 — build herald**
-1. Install Hermes Agent, use a local model (Hermes 4 via Ollama/llama.cpp).
-2. Copy `hermes-watch/fix-build.skill.md` into Hermes' skills dir.
-3. Set `HERMES_WATCH_REPO` / `HERMES_BUILD_CMD` / `WATCH_BRANCH` /
-   `SLACK_WEBHOOK_URL`.
-4. Wire a trigger (see `hermes-watch/triggers.md`): HTTP on push + cron safety net.
+## Rollout
 
-**M3 — handoff**
-1. Define each repo's canonical build command (`./ci.sh <build|test>`).
-2. Run `router/` (`node server.mjs`), point a GitHub webhook at it.
-3. Add rules: push→Hermes, `to: codex` issue→Codex, PR→human for Antigravity.
-4. Agents read/write the handoff envelope in issues; humans merge features,
-   auto-merge build-only fixes.
+The recommended order is deliberately conservative:
 
-**M4 — hub + remote**
-- DeepSeek Harness as the router (register the same GitHub webhook against its
-  GitHub adapter) and as the in-house multi-agent debug layer. Choose relay or
-  DSH adapter per action.
-- Later: expose the router + DSH web UI over a private tunnel for remote access.
+### M0 — Manual benchmark
 
-## Decisions locked in (this conversation)
+Use one real low-risk DualDex issue and manually run:
 
-- **Antigravity is interactive/human-steered** → implementation is a human step;
-  automation handles Codex/Hermes/DSH edges.
-- **DeepSeek = both hub/router and in-house debug layer.**
-- **Auto-merge build-only fixes; human approval on features.**
-- **Single machine**, self-hosted; remote access is a later nice-to-have.
+```text
+human goal
+→ Codex plan
+→ human-steered Antigravity implementation
+→ Codex review
+→ build/tests
+→ human merge
+```
 
-## Open item (per repo)
+Do not automate a role split that has not proven useful manually.
 
-- **Canonical build command** — every agent must run the same `./ci.sh`. Define
-  it per repo in M1.
+### M1 — Visibility
 
-## Honest caveats
+Wire concise project notifications into Slack. Start with `#dual-dex`. Post meaningful transitions, not every edit/tool call.
 
-- **Accuracy:** the Codex `hooks.json` schema and the Hermes skill/cron/trigger
-  syntax are adapted from each product's docs and can drift between versions —
-  verify against your installed versions. The **logic** (ownership rules, the
-  envelope, the bounded fix loop, the routing) is version-independent.
-- **Security:** never commit real `.env`/secrets; GitHub webhook secrets and Slack
-  URLs should live in a secret store. The router warns you to set a signature
-  secret and to only accept webhooks on a trusted network.
+### M1.5 — Safety/control plane
+
+Before any unattended code execution:
+
+- authenticated + deduplicated GitHub events;
+- trusted authorization gate;
+- safe process dispatch (`shell: false`);
+- SQLite state;
+- validated handoff schema;
+- per-task worktrees and leases;
+- path/scope enforcement;
+- timeouts and concurrency limits.
+
+### M2 — Hermes repair pilot
+
+Define the canonical DualDex CI commands, run them in GitHub Actions, then let Hermes attempt controlled mechanical fixes on deliberately broken test branches. GitHub Actions remains authoritative and humans still merge.
+
+### Evaluation gate
+
+Stop and ask whether the stack is actually saving time. If not, simplify it before proceeding.
+
+### M3 — Structured handoffs
+
+Automate Codex planning → implementation readiness → review → CI transitions while preserving durable state and explicit ownership.
+
+### M4 — Operations/convenience
+
+Only after the core flow is reliable: authenticated Slack controls, DeepSeek specialist workflows, health/status views, and optional private remote access.
+
+### M5 — Product expansion
+
+Use the proven system on SaveBridge, then later on Dungeon Dispatcher where appropriate. Agents can own implementation plumbing; humans still own product/game-design judgment.
+
+See [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) for the actual task list and gates.
+
+## Current prototype caveats
+
+The checked-in router and helper scripts are scaffolding. Before unattended use, the most important changes are:
+
+- replace `shell: true` command interpolation;
+- parse/validate the handoff envelope instead of matching only generic webhook fields;
+- add correct issue/PR/task identifiers;
+- require signatures outside explicit local dev;
+- add authorization, SQLite state, dedupe, timeouts, concurrency, worktrees, and leases;
+- move Slack/secrets configuration outside agent-controlled worktrees;
+- make GitHub Actions the required-check authority.
+
+Do not expose the current router publicly or give it unattended code-editing authority until those items are complete.
+
+## Definition of success
+
+This project succeeds if it helps Sonoran Solutions ship products faster and more safely.
+
+The first meaningful milestone is not "four agents can talk to each other." It is:
+
+> One real DualDex task can move from scoped goal → implementation → review → independent CI → human merge with less context loss and less repetitive work than the manual workflow.
+
+If maintaining the orchestrator starts consuming more time than it saves, pause it and return effort to SaveBridge / Dungeon Dispatcher.
