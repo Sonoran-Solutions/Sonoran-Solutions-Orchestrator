@@ -1,48 +1,95 @@
-# Triggers for the build watcher
+# Triggers for the Hermes repair worker
 
-The `fix-build` skill needs to be *started* when the watcher should act. Two ways:
+The `fix-build` skill should start only for a **known, authorized task/run**. A raw public push/issue event should not directly grant Hermes repository write access.
 
-## 1. HTTP trigger (preferred — event-driven)
+## Preferred trigger path
 
-Hermes supports HTTP triggers (per the docs). Register one that starts `fix-build`
-when a push/PR webhook arrives for the watched repo. A push event is the natural
-"something changed, go build" signal.
-
-```bash
-# Example (GitHub webhook -> router -> Hermes HTTP trigger):
-# The router (../router/) can POST here on a matching GitHub event.
-curl -X POST http://127.0.0.1:<hermes-http-port>/trigger \
-  -H 'Content-Type: application/json' \
-  -d '{"repo":"myorg/project","branch":"feat/123","event":"push"}'
+```text
+GitHub event / CI result
+        │
+        ▼
+Sonoran router
+  - verify signature
+  - dedupe delivery
+  - authorize task
+  - validate state/envelope
+  - allocate Hermes lease/worktree
+        │
+        ▼
+Hermes trigger
+  - task_id
+  - run_id
+  - worktree
+  - branch/base SHA
+  - allowed paths
+  - build command
+  - attempt budget
 ```
 
-## 2. Cron fallback (ensures a stuck build is never silently left red)
+This keeps Hermes focused on repair reasoning while the router owns authorization and orchestration policy.
 
-A cron job that periodically runs the build check on the watched branch. If it's
-red and no fix is in progress, start the loop.
+## HTTP trigger
 
-```yaml
-# Representative declaration — CONFIRM the exact cron/trigger schema against
-# https://hermes-agent.nousresearch.com/docs/ (it varies by Hermes version).
-cron:
-  - name: build-watch-feat
-    schedule: "*/5 * * * *"      # every 5 minutes
-    command: fix-build
-    env:
-      HERMES_WATCH_REPO: /path/to/repo
-      HERMES_BUILD_CMD: ./ci.sh test
-      WATCH_BRANCH: feat/123
+An HTTP trigger is appropriate after the event has passed the router's policy checks.
+
+Representative payload:
+
+```json
+{
+  "task_id": "ss-141",
+  "run_id": "ss-141-003",
+  "repo": "sonoran-solutions/dualdex",
+  "branch": "fix/141",
+  "base_sha": "8f2c91a44d8f",
+  "worktree": "/worktrees/dualdex/issue-141-hermes",
+  "build_cmd": "./ci.sh test",
+  "attempt": 2,
+  "max_attempts": 3
+}
 ```
 
-> **Verify:** the precise YAML keys for cron / HTTP triggers and how to pass `env`
-> differ between Hermes versions. Check the current docs before wiring — the
-> *logic* in `fix-build.skill.md` is stable; the trigger syntax is not.
+The exact Hermes HTTP-trigger syntax/API must be confirmed against the installed Hermes version.
 
-## Recommended setup
+## GitHub-native/event integration
 
-- **HTTP trigger** for immediacy on real commits.
-- **Cron every few minutes** as the safety net, with a guard so it doesn't start a
-  second `fix-build` for a branch that's already being fixed.
-- Use a **local model** (Hermes 4 via [Ollama](https://hermes-agent.nousresearch.com/docs/guides/local-ollama-setup) or the
-  [built-in local runtime](https://hermes-agent.nousresearch.com/docs/user-guide/local-models))
-  so poll-and-fix loops cost nothing in API fees.
+If Hermes is later configured to receive GitHub events directly, it must not bypass the same security model. Either:
+
+1. the direct integration is limited to non-mutating observation; or
+2. it performs equivalent authorization/dedupe/task validation before any code-changing repair begins.
+
+Do not maintain two independent systems that can both launch the same repair.
+
+## Cron fallback
+
+Cron can be useful for detecting a stuck orchestrator/run, but it should **not** blindly poll a branch and start a second repair loop.
+
+A safe cron-style check should ask the durable task store/router something like:
+
+```text
+Are there authorized Hermes runs in assigned/in_progress state
+that have no live worker and whose lease/retry policy allows restart?
+```
+
+Only then should it resume/re-dispatch the known run according to policy.
+
+Do not make "branch is red" alone sufficient to start arbitrary repair work.
+
+## Required anti-duplication behavior
+
+Before Hermes starts:
+
+- GitHub delivery/event has been deduplicated;
+- task/run ID is known;
+- no conflicting active lease exists;
+- the current attempt budget allows work;
+- the worktree/base SHA still matches the lease.
+
+If any condition fails, report/escalate rather than launching another worker.
+
+## Secrets
+
+Do not pass Slack/GitHub/model secrets through task-controlled files in the worktree. The orchestration process should inject only the minimum required credentials/configuration from outside the checkout.
+
+## Implementation order
+
+Trigger wiring is an **M2 task**. Complete the M1.5 router/auth/state/worktree work first. See [`../IMPLEMENTATION_ROADMAP.md`](../IMPLEMENTATION_ROADMAP.md).
