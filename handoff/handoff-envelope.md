@@ -137,7 +137,7 @@ allowed_paths:
 required_checks:
   - build
   - e2e
- task: Fix the Safari layout regression without changing public behavior.
+task: Fix the Safari layout regression without changing public behavior.
 summary: |
   Five bounded repair attempts were tried. All either left the WebKit failure
   unchanged or regressed tests/e2e.spec.js. The remaining hypothesis appears to
