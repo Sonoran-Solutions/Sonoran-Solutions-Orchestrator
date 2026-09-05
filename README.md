@@ -51,7 +51,7 @@ Tailscale           = private machine connectivity
 Renovate            = dependency maintenance
 ```
 
-See [`TOOLING_STACK.md`](TOOLING_STACK.md) for boundaries, adoption rules, and the recommended integration model.
+See [`TOOLING_STACK.md`](TOOLING_STACK.md) for boundaries/integration rules and [`TOOLING_ROADMAP.md`](TOOLING_ROADMAP.md) for the phased adoption checklist.
 
 ## Core safety rules
 
@@ -70,8 +70,9 @@ See [`TOOLING_STACK.md`](TOOLING_STACK.md) for boundaries, adoption rules, and t
 | Path | Purpose |
 |---|---|
 | [`AGENT_ORCHESTRATION_PLAN.md`](AGENT_ORCHESTRATION_PLAN.md) | Full architecture, authority model, trust boundaries, state machine, CI/review flow, and rollout strategy |
-| [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) | Phased project checklist from manual DualDex pilot through safe automation |
+| [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) | Core phased checklist from manual DualDex pilot through safe automation |
 | [`TOOLING_STACK.md`](TOOLING_STACK.md) | Supporting tools: Linear, Rulesets, 1Password, Sentry, Tailscale, Renovate, Taskfile, and parked Dagger option |
+| [`TOOLING_ROADMAP.md`](TOOLING_ROADMAP.md) | Parallel `TOOL-###` adoption tasks aligned to the core orchestrator phases |
 | `handoff/` | Versioned machine-readable handoff envelope and task-state rules |
 | `slack-notify/` | Early notification helpers; should evolve toward state-transition notifications rather than tool-call spam |
 | `hermes-watch/` | Hermes repair skill/scaffolding; must be integrated with task scope, worktrees, leases, and independent CI before unattended use |
@@ -147,7 +148,7 @@ Use the proven system on SaveBridge, then later on Dungeon Dispatcher where appr
 
 Dagger remains parked until local/hosted CI divergence becomes a demonstrated problem.
 
-See [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) for the actual task list and gates.
+See [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) for the core implementation gates and [`TOOLING_ROADMAP.md`](TOOLING_ROADMAP.md) for the parallel supporting-tool checklist.
 
 ## Current prototype caveats
 
