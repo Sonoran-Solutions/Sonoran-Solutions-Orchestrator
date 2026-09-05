@@ -1,85 +1,104 @@
 # Slack notification kit
 
-Posts a change event to a project's Slack channel. One incoming webhook per
-project channel is the simplest wiring. Works for **Codex**, **DeepSeek Harness**,
-and (via the GitHub action) any agent that pushes to the repo.
+Prototype helpers for sending Sonoran Solutions workflow events to project Slack channels.
+
+**Current direction:** Slack is a human-facing operations view, not the durable task database. Default notifications should describe meaningful **task-state transitions**, not every tool call or file edit.
+
+See [`../AGENT_ORCHESTRATION_PLAN.md`](../AGENT_ORCHESTRATION_PLAN.md) and [`../IMPLEMENTATION_ROADMAP.md`](../IMPLEMENTATION_ROADMAP.md) before wiring this for unattended workers.
+
+## Recommended channel model
+
+Organize channels around projects:
+
+- `#dual-dex`
+- `#savebridge` (when active)
+- `#dungeon-dispatcher` (when active)
+- `#agent-ops` for orchestrator-wide failures/alerts
+
+Do not create one channel per agent. The agents are implementation details; projects are the durable unit humans care about.
+
+## Default notification policy
+
+Top-level project messages should normally be limited to:
+
+- ▶️ task assigned/started;
+- 🧪 PR ready / verification started;
+- 🚨 blocked or escalated;
+- ✅ completed/merged;
+- ⛔ stopped/cancelled.
+
+Detailed retry logs, compiler output, tool calls, and file-edit chatter belong in GitHub/task logs. If a task needs discussion, prefer one Slack thread tied to the GitHub issue/PR.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `slack-notify.sh` | Posts to a Slack incoming webhook. Safe offline mode via `DRY_RUN=1`. |
-| `hooks.json` | Codex/DSH hook config — fires the script after file-modifying tools. |
-| `.env.example` | Webhook + identity settings. Copy to `.env`, fill in, never commit. |
-| `workflows/slack-notify.yml` | GitHub → Slack on push/PR (the cross-harness backstop). |
+| `slack-notify.sh` | Prototype incoming-webhook sender with `DRY_RUN=1`. |
+| `hooks.json` | Legacy/experimental Codex/DSH mutation hook wiring. Useful for testing attribution, but too noisy for the target default workflow. |
+| `.env.example` | Prototype configuration example. **Do not make task-controlled repo `.env` files the secret source for unattended orchestration.** |
+| `workflows/slack-notify.yml` | GitHub → Slack example/backstop. Tune events so it does not duplicate router/app notifications. |
 
-## Install per repo
+## Security/configuration direction
 
-Copy this whole `slack-notify/` folder into each repo as `.agent-stack/` (or
-symlink it), then drop a `.env` at the repo root or in `.agent-stack/`:
+For the initial manual M1 visibility phase, a local `.env` can be convenient for smoke tests.
 
-```bash
-mkdir -p .agent-stack
-cp -r /home/dq/agent-stack/slack-notify/. .agent-stack/
-cp .agent-stack/.env.example .env      # then fill in SLACK_WEBHOOK_URL etc.
-chmod +x .agent-stack/slack-notify.sh
-```
+Before unattended workers are enabled:
 
-## 1. Create the webhook
+- keep Slack credentials in orchestration-owned configuration **outside task worktrees**;
+- do not source arbitrary `.env` files from agent-controlled repository checkouts;
+- inject only the minimum Slack configuration required by the notification process;
+- never include tokens/webhook URLs in GitHub issues, PRs, handoff envelopes, or logs.
 
-- Slack → *Apps* → **Incoming Webhooks** → *Add to Slack* → pick the project
-  channel → copy the `https://hooks.slack.com/services/...` URL.
-- Put it in `.env` as `SLACK_WEBHOOK_URL`. Every agent and action reads the same
-  webhook, so one URL per project channel.
+The current `slack-notify.sh` still supports repo-local `.env` loading because it is prototype scaffolding. Treat removing/replacing that behavior as part of M1/M1.5, not as the long-term secret model.
 
-## 2. Test it (no network needed first)
+## M1 smoke test
+
+Use the helper only to prove the outbound path works:
 
 ```bash
-cd <repo>
-DRY_RUN=1 .agent-stack/slack-notify.sh test      # prints payload, does not post
-.agent-stack/slack-notify.sh test                # real post once webhook is set
+DRY_RUN=1 ./slack-notify.sh test
+./slack-notify.sh test
 ```
 
-## 3. Wire it into each agent
+Then verify a real DualDex task/PR can produce one concise message linking back to GitHub.
 
-**Codex** — point Codex at a hooks config. Copy `hooks.json` to
-`.codex/hooks.json` in the repo, or set your global/project hook config to
-load it. The `PostToolUse` matcher triggers the script, which filters out
-non-file-changing tools (compiles, reads, etc.) and posts only for edits and
-commit/push commands.
+## Mutation hooks
 
-**DeepSeek Harness** — the harness runs your existing Codex hooks config, so the
-same `hooks.json` just works. Mount the adapter pointing at it:
+`hooks.json` and the `tool` subcommand can still be useful during development to understand what Codex/DeepSeek are doing, but **do not enable mutation-level messages as the normal project-channel experience**.
 
-```yaml
-- name: '@deepseek-ai/dsh-hooks-codex'
-  config:
-    configPath: ./.codex/hooks.json     # or wherever you keep hooks.json
-    model: deepseek-v4
-```
-
-Inside the harness, the `tool` subcommand reads the hook payload on stdin and
-notifies only for file mutations / commits / pushes (tunable via `MUTATION_RE`).
-
-**Antigravity** — you use the interactive app, so it has no hooks.json. Two
-options: rely on the GitHub → Slack workflow (Layer A) to report its commits, or
-have it call `postMessage` through a Slack MCP server if you wire one up later.
-
-## 4. GitHub → Slack (the backstop)
-
-Copy `workflows/slack-notify.yml` to `.github/workflows/slack-notify.yml` and add
-`SLACK_WEBHOOK_URL` as a **repo/org secret**. This reports *every* push/PR from
-*any* agent (Codex, Antigravity, Hermes, DeepSeek) or human — so nothing slips
-through even if a per-agent hook misses.
-
-## Test the filter without Slack
+If you temporarily test them:
 
 ```bash
-# A "read"-type tool should NOT notify (exits quietly):
+# A read-type tool should be ignored.
 echo '{"tool_name":"Read","tool_input":{"file_path":"src/a.ts"}}' \
-  | .agent-stack/slack-notify.sh tool && echo "sent" || echo "skipped"
+  | DRY_RUN=1 ./slack-notify.sh tool
 
-# A file-edit tool SHOULD notify (DRY_RUN prints the payload):
+# A file-edit tool can be inspected in dry-run mode.
 echo '{"tool_name":"Edit","tool_input":{"file_path":"src/a.ts"}}' \
-  | DRY_RUN=1 .agent-stack/slack-notify.sh tool
+  | DRY_RUN=1 HOOK_ALWAYS=1 ./slack-notify.sh tool
 ```
+
+Keep this debug signal separate from the eventual state-transition notifications.
+
+## GitHub → Slack backstop
+
+A GitHub Action can report cross-harness events, but avoid configuring multiple layers to post the same event. Pick one owner for each notification category.
+
+For example:
+
+- GitHub/Actions → verification state;
+- router → assignment/escalation/task completion state;
+- `#agent-ops` → orchestrator failures.
+
+## Future Slack control plane
+
+Incoming webhooks are outbound-only scaffolding. After M3 is reliable, a real Sonoran Orchestrator Slack app can provide authenticated commands such as:
+
+```text
+status <task>
+stop <task>
+retry <task>
+approve <task>
+```
+
+Those commands must translate into validated router/GitHub state transitions. Slack itself never becomes the source of truth.
