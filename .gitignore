@@ -1,0 +1,7 @@
+# Secrets / local config — never commit these
+.env
+.env.*
+!.env.example
+*.log
+router/config.local.json
+router/dispatch.log

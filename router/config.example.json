@@ -1,0 +1,27 @@
+{
+  "port": 8090,
+  "githubSecret": "REPLACE_WITH_YOUR_GITHUB_WEBHOOK_SECRET",
+  "cwd": "/home/dq/agent-stack/work",
+  "slackWebhook": "https://hooks.slack.com/services/REPLACE_WITH_REAL_TOKEN",
+  "dispatchLog": "dispatch.log",
+  "targets": [
+    {
+      "name": "push -> wake build watcher (Hermes)",
+      "when": { "events": ["push"], "refBranch": "feat/.*|fix/.*" },
+      "run": { "type": "http", "url": "http://127.0.0.1:8765/trigger", "method": "POST", "body": { "repo": "{{repo}}", "branch": "{{branch}}", "event": "{{event}}" } },
+      "slack": "⏱ *{{repo}}* push on `{{branch}}` — waking build watcher"
+    },
+    {
+      "name": "issue to:codex -> wake codex debugger",
+      "when": { "events": ["issues", "issue_comment"], "action": "opened" },
+      "run": { "type": "exec", "command": "codex exec --full-auto \"Debug issue {{head}} from {{sender}} on {{branch}}\"" },
+      "slack": "🐞 *{{repo}}* new issue from {{sender}} — dispatched to codex"
+    },
+    {
+      "name": "feature ready -> notify human to drive Antigravity",
+      "when": { "events": ["pull_request"], "action": "opened" },
+      "run": { "type": "http", "url": "http://127.0.0.1:8090/noop", "method": "POST" },
+      "slack": "🧑‍💻 *{{repo}}* PR opened on `{{branch}}` — human should drive Antigravity, then review/merge"
+    }
+  ]
+}

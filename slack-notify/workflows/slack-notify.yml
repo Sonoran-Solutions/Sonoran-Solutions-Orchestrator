@@ -1,0 +1,39 @@
+name: Slack notify (per-project channel)
+
+# Layer A — GitHub -> Slack. Fires for every agent AND human that pushes or
+# opens a PR, so it is the reliable "source of truth" for "what changed."
+# Copy this into each repo as: .github/workflows/slack-notify.yml
+# Add SLACK_WEBHOOK_URL as a repo/org secret (the same one the agents use).
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      EVENT_NAME: ${{ github.event_name }}
+      HEAD_REF: ${{ github.head_ref || github.ref_name }}
+      REPO: ${{ github.repository }}
+      ACTOR: ${{ github.actor }}
+      SHA: ${{ github.sha }}
+      HTML_URL: ${{ github.event.head_commit.url || github.event.html_url }}
+    steps:
+      - name: Post to Slack
+        run: |
+          test -n "$SLACK_WEBHOOK_URL" || { echo "SLACK_WEBHOOK_URL secret is not set"; exit 1; }
+          MSG="*${REPO}* — ${EVENT_NAME} by ${ACTOR} on ${HEAD_REF}"
+          MSG="${MSG}\nCommit: \`${SHA}\`"
+          MSG="${MSG}\n<${HTML_URL}|links>"
+          PAYLOAD="$(jq -n --arg m "$MSG" '{text: $m}')"
+          http_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H 'Content-type: application/json' \
+            --data "$PAYLOAD" \
+            "$SLACK_WEBHOOK_URL")"
+          echo "Slack HTTP $http_code"
+          [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ] || exit 1

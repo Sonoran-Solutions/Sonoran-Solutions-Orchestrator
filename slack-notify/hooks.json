@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/openai/codex/main/docs/hooks.json",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|Bash|bash|write|str-replace-editor|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./.agent-stack/slack-notify.sh tool",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
