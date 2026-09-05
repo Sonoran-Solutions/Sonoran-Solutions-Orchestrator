@@ -1,55 +1,113 @@
-# Hermes Build Watcher
+# Hermes CI Repair Worker
 
-The always-on **build herald** that watches a branch, keeps it green, and
-escalates to Codex when a failure needs real debugging. Matches your "Hermes
-agent that can do live debugging while running a build."
+Hermes is the **bounded CI repair technician** in the Sonoran Solutions workflow.
 
-## Install
+It should not blindly watch a shared branch and continuously mutate code. The target model is narrower: an **authorized task** receives an isolated worktree/lease, Hermes reproduces a concrete CI failure, attempts a small mechanical repair, pushes a candidate, and then waits for **independent GitHub Actions verification + review**.
 
-1. Install Hermes Agent ([docs](https://hermes-agent.nousresearch.com/docs/)) on
-   your box. Run it self-hosted with the terminal UI
-   (`hermes`) and the messaging gateway so it can post to Slack.
-2. Use a **local model** (Hermes 4 via Ollama / the built-in local runtime) for
-   the fix loop — free and fast enough for 100-step loops.
-3. Copy `fix-build.skill.md` into your Hermes **skills** directory (adapt the
-   front-matter to your Hermes version).
-4. Set up triggers (see [`triggers.md`](triggers.md)) — an HTTP trigger for
-   push-driven checks plus a cron safety net.
-5. Give Hermes a `.env` with `HERMES_WATCH_REPO`, `HERMES_BUILD_CMD`,
-   `WATCH_BRANCH`, and `SLACK_WEBHOOK_URL` (the same project webhook the other
-   agents use).
+See [`fix-build.skill.md`](fix-build.skill.md) for the operating procedure and [`../IMPLEMENTATION_ROADMAP.md`](../IMPLEMENTATION_ROADMAP.md) for the M2 pilot.
 
-## What it does
+## Role
 
+Hermes may:
+
+- reproduce the canonical build/test failure;
+- inspect the files implicated by that failure;
+- make a small repair inside the assigned `allowed_paths`;
+- run the canonical local CI command;
+- push a candidate fix;
+- escalate with evidence when it is stuck or judgment is required.
+
+Hermes may **not**:
+
+- expand its own scope;
+- make product/API/schema/security decisions;
+- weaken meaningful tests just to get green;
+- share a dirty checkout with another worker;
+- declare its own local result authoritative;
+- merge its own repair.
+
+## Pilot setup
+
+Do not begin here. Complete the M1.5 safety/control-plane phase first.
+
+For M2:
+
+1. Define the DualDex canonical CI command(s).
+2. Run the same CI contract in GitHub Actions.
+3. Configure the router to allocate an authorized task/run/worktree lease.
+4. Install Hermes and the `fix-build` skill.
+5. Provide validated task context such as:
+   - task/run ID;
+   - isolated worktree path;
+   - branch/base SHA;
+   - allowed paths;
+   - canonical build command;
+   - attempt/max-attempt state.
+6. Keep orchestration secrets outside the task worktree.
+7. Start with **deliberately broken pilot branches** before real autonomous repair.
+
+## Target flow
+
+```text
+GitHub Actions failure on authorized task
+        │
+        ▼
+router validates task + assigns Hermes lease
+        │
+        ▼
+Hermes reproduces canonical failure locally
+        │
+        ├─ requires judgment/scope expansion ──▶ escalate + stop
+        │
+        ▼
+small mechanical repair within allowed paths
+        │
+        ▼
+local canonical CI command
+        │
+        ├─ regression ──▶ revert attempt
+        │
+        └─ promising/green ──▶ commit + push candidate
+                                  │
+                                  ▼
+                           GitHub Actions
+                                  │
+                    ┌─────────────┴─────────────┐
+                    │                           │
+                  green                         red
+                    │                           │
+               Codex review              retry only if
+                    │                     budget/scope allow
+               human merge
+             (initial policy)
 ```
-push / cron
-   │
-   ▼
-run $HERMES_BUILD_CMD ── green ──▶ post ✅ to Slack, wait
-   │
-   ▼ red
-collect errors → patch smallest fix → rebuild
-   ├─ fixed (≤5 tries) ──▶ commit + push + post fix summary
-   └─ still red / needs design ──▶ open fix/<issue>, envelope to: codex,
-                                    post escalation, stop
-```
 
-## Guardrails (baked into the skill)
+## Attempt policy
 
-- Max 5 fix attempts, then escalate — no infinite loops.
-- Revert on regression; one scoped commit per fix.
-- No design decisions — escalate instead of inventing behavior.
-- One canonical `$HERMES_BUILD_CMD` shared by every agent = one definition of green.
+The attempt ceiling should come from the task/router rather than be hard-coded into Hermes.
+
+For the initial pilot, start low (for example **3 attempts**) and measure whether extra attempts produce useful fixes or just churn. Reaching the limit means escalation, not resetting the counter.
+
+## Slack policy
+
+Avoid posting every build/retry/edit.
+
+Useful project-channel transitions are:
+
+- repair started/assigned (optional if router already posted it);
+- candidate ready / CI verification started;
+- blocked/escalated;
+- verified/review-ready.
+
+Detailed logs belong in GitHub/task logs.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `fix-build.skill.md` | The operating procedure (loop + limits + escalation). |
-| `triggers.md` | How to start the watcher (HTTP trigger + cron safety net). |
+| `fix-build.skill.md` | Repair procedure, limits, scope rules, CI handoff, escalation. |
+| `triggers.md` | How Hermes should be awakened without bypassing task authorization/state. |
 
-## Note on accuracy
+## Accuracy note
 
-Hermes' exact skill/cron/trigger config schema changes across versions. The
-**procedure** in `fix-build.skill.md` is the durable part; confirm the current
-`cron`/`trigger`/skill front-matter syntax in the Hermes docs before wiring.
+Hermes' exact skill/trigger configuration can change between versions. Confirm current syntax against Hermes documentation when implementing M2. The durable part of this repo is the **workflow contract**: authorized task, isolated worktree, bounded mechanical repair, independent CI, review, escalation.
