@@ -1,10 +1,14 @@
 # Slack notification kit
 
-Prototype helpers for sending Sonoran Solutions workflow events to project Slack channels.
+Helpers for sending Sonoran Solutions workflow events to project Slack channels.
 
-**Current direction:** Slack is a human-facing operations view, not the durable task database. Default notifications should describe meaningful **task-state transitions**, not every tool call or file edit.
+**Policy:** Slack is a human-facing operations view, not the durable task
+database. Default notifications describe meaningful **task-state transitions**,
+not every tool call or file edit.
 
-See [`../AGENT_ORCHESTRATION_PLAN.md`](../AGENT_ORCHESTRATION_PLAN.md) and [`../IMPLEMENTATION_ROADMAP.md`](../IMPLEMENTATION_ROADMAP.md) before wiring this for unattended workers.
+See [`../AGENT_ORCHESTRATION_PLAN.md`](../AGENT_ORCHESTRATION_PLAN.md) and
+[`../IMPLEMENTATION_ROADMAP.md`](../IMPLEMENTATION_ROADMAP.md) before wiring this
+for unattended workers.
 
 ## Recommended channel model
 
@@ -15,90 +19,69 @@ Organize channels around projects:
 - `#dungeon-dispatcher` (when active)
 - `#agent-ops` for orchestrator-wide failures/alerts
 
-Do not create one channel per agent. The agents are implementation details; projects are the durable unit humans care about.
+Do not create one channel per agent. Agents are implementation details; projects
+are the durable unit humans care about.
 
-## Default notification policy
+## Default notification policy (ORCH-034/035)
 
-Top-level project messages should normally be limited to:
+Top-level project messages are limited to these five transitions:
 
-- ▶️ task assigned/started;
-- 🧪 PR ready / verification started;
-- 🚨 blocked or escalated;
-- ✅ completed/merged;
-- ⛔ stopped/cancelled.
+| Command | Meaning |
+|---|---|
+| `task-started <task>` | ▶️ task assigned/started |
+| `pr-ready <task>` | 🧪 PR ready / verification started |
+| `blocked <task> --reason <why>` | 🚨 blocked or escalated |
+| `done <task>` | ✅ completed/merged |
+| `stopped <task> --reason <why>` | 🛑 stopped/cancelled |
 
-Detailed retry logs, compiler output, tool calls, and file-edit chatter belong in GitHub/task logs. If a task needs discussion, prefer one Slack thread tied to the GitHub issue/PR.
+Per-file/tool-call notifications are **removed**. Compiler output, tool calls,
+and retry logs belong in GitHub/task logs, not the project channel.
+
+## Configuration (ORCH-037/038/039)
+
+The script reads plain `KEY=VALUE` lines from:
+
+```
+$SONORAN_CONFIG_DIR/orchestrator.env    # default: ~/.config/sonoran/orchestrator.env
+```
+
+- Config lives **outside task worktrees**.
+- Values are parsed line-by-line and **never sourced/evaluated** as Bash.
+- Environment variables override the file.
+
+Copy [`sonoran.env.example`](sonoran.env.example) to `~/.config/sonoran/orchestrator.env`
+and fill in the webhook URL. (Optional env vars: `SONORAN_CONFIG_DIR`,
+`SONORAN_CONFIG_FILE`, `SLACK_CHANNEL`, `DRY_RUN`.)
+
+## Smoke test
+
+```bash
+DRY_RUN=1 ./slack-notify.sh test                 # prints payload, no network
+./slack-notify.sh test                           # real post once config is set
+./slack-notify.sh pr-ready "ORCH-042" --link "https://github.com/Sonoran-Solutions/dualdex/pull/1"
+```
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `slack-notify.sh` | Prototype incoming-webhook sender with `DRY_RUN=1`. |
-| `hooks.json` | Legacy/experimental Codex/DSH mutation hook wiring. Useful for testing attribution, but too noisy for the target default workflow. |
-| `.env.example` | Prototype configuration example. **Do not make task-controlled repo `.env` files the secret source for unattended orchestration.** |
-| `workflows/slack-notify.yml` | GitHub → Slack example/backstop. Tune events so it does not duplicate router/app notifications. |
+| `slack-notify.sh` | State-transition sender with safe config loading + `DRY_RUN=1`. |
+| `sonoran.env.example` | Orchestration config template (goes in `~/.config/sonoran/`, not the repo). |
+| `hooks.json` | Empty no-op. Per-tool Codex/DSH hooks were removed — notifications now fire on state transitions via the router/GitHub Actions. |
+| `workflows/slack-notify.yml` | GitHub → Slack example/backstop for push/PR events. |
 
-## Security/configuration direction
+## Ownership (avoid duplicate posts)
 
-For the initial manual M1 visibility phase, a local `.env` can be convenient for smoke tests.
+Pick one owner per notification category:
 
-Before unattended workers are enabled:
-
-- keep Slack credentials in orchestration-owned configuration **outside task worktrees**;
-- do not source arbitrary `.env` files from agent-controlled repository checkouts;
-- inject only the minimum Slack configuration required by the notification process;
-- never include tokens/webhook URLs in GitHub issues, PRs, handoff envelopes, or logs.
-
-The current `slack-notify.sh` still supports repo-local `.env` loading because it is prototype scaffolding. Treat removing/replacing that behavior as part of M1/M1.5, not as the long-term secret model.
-
-## M1 smoke test
-
-Use the helper only to prove the outbound path works:
-
-```bash
-DRY_RUN=1 ./slack-notify.sh test
-./slack-notify.sh test
-```
-
-Then verify a real DualDex task/PR can produce one concise message linking back to GitHub.
-
-## Mutation hooks
-
-`hooks.json` and the `tool` subcommand can still be useful during development to understand what Codex/DeepSeek are doing, but **do not enable mutation-level messages as the normal project-channel experience**.
-
-If you temporarily test them:
-
-```bash
-# A read-type tool should be ignored.
-echo '{"tool_name":"Read","tool_input":{"file_path":"src/a.ts"}}' \
-  | DRY_RUN=1 ./slack-notify.sh tool
-
-# A file-edit tool can be inspected in dry-run mode.
-echo '{"tool_name":"Edit","tool_input":{"file_path":"src/a.ts"}}' \
-  | DRY_RUN=1 HOOK_ALWAYS=1 ./slack-notify.sh tool
-```
-
-Keep this debug signal separate from the eventual state-transition notifications.
-
-## GitHub → Slack backstop
-
-A GitHub Action can report cross-harness events, but avoid configuring multiple layers to post the same event. Pick one owner for each notification category.
-
-For example:
-
-- GitHub/Actions → verification state;
-- router → assignment/escalation/task completion state;
+- GitHub Actions → verification/PR state;
+- router → assignment/escalation/task-completion state;
 - `#agent-ops` → orchestrator failures.
 
 ## Future Slack control plane
 
-Incoming webhooks are outbound-only scaffolding. After M3 is reliable, a real Sonoran Orchestrator Slack app can provide authenticated commands such as:
-
-```text
-status <task>
-stop <task>
-retry <task>
-approve <task>
-```
-
-Those commands must translate into validated router/GitHub state transitions. Slack itself never becomes the source of truth.
+Incoming webhooks are outbound-only scaffolding. After M3 is reliable, a real
+Sonoran Orchestrator Slack app can provide authenticated commands such as
+`status <task>`, `stop <task>`, `retry <task>`, `approve <task>`. Those commands
+must translate into validated router/GitHub state transitions — Slack never
+becomes the source of truth.

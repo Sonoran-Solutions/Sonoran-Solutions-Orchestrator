@@ -1,27 +1,41 @@
 {
   "port": 8090,
-  "githubSecret": "REPLACE_WITH_YOUR_GITHUB_WEBHOOK_SECRET",
-  "cwd": "/home/dq/agent-stack/work",
-  "slackWebhook": "https://hooks.slack.com/services/REPLACE_WITH_REAL_TOKEN",
-  "dispatchLog": "dispatch.log",
-  "targets": [
+  "devMode": false,
+  "bodyLimitBytes": 1048576,
+  "defaultTimeoutMs": 120000,
+  "maxConcurrency": 2,
+  "shutdownGraceMs": 8000,
+  "githubSecretEnv": "GITHUB_WEBHOOK_SECRET",
+  "slackWebhookEnv": "SLACK_WEBHOOK_URL",
+  "stateDb": "state.sqlite",
+  "reposRoot": "/home/dq/sonoran-checkouts",
+  "worktreeRoot": "/home/dq/sonoran-worktrees",
+  "allowlist": ["devils-17"],
+  "requireLabel": "agent:ready",
+  "workers": {
+    "notify": {
+      "program": "../slack-notify/slack-notify.sh",
+      "args": ["pr-ready", "{{task}}", "--link", "{{link}}"]
+    },
+    "codex": {
+      "program": "codex",
+      "args": ["exec", "--full-auto", "{{prompt}}"],
+      "createsTask": true,
+      "allowedPaths": ["app/src/**", "native/**", "*.md"]
+    }
+  },
+  "rules": [
     {
-      "name": "push -> wake build watcher (Hermes)",
-      "when": { "events": ["push"], "refBranch": "feat/.*|fix/.*" },
-      "run": { "type": "http", "url": "http://127.0.0.1:8765/trigger", "method": "POST", "body": { "repo": "{{repo}}", "branch": "{{branch}}", "event": "{{event}}" } },
-      "slack": "⏱ *{{repo}}* push on `{{branch}}` — waking build watcher"
+      "id": "pr-opened-notify",
+      "when": { "events": ["pull_request"], "actions": ["opened"] },
+      "worker": "notify",
+      "authorize": "trusted"
     },
     {
-      "name": "issue to:codex -> wake codex debugger",
-      "when": { "events": ["issues", "issue_comment"], "action": "opened" },
-      "run": { "type": "exec", "command": "codex exec --full-auto \"Debug issue {{head}} from {{sender}} on {{branch}}\"" },
-      "slack": "🐞 *{{repo}}* new issue from {{sender}} — dispatched to codex"
-    },
-    {
-      "name": "feature ready -> notify human to drive Antigravity",
-      "when": { "events": ["pull_request"], "action": "opened" },
-      "run": { "type": "http", "url": "http://127.0.0.1:8090/noop", "method": "POST" },
-      "slack": "🧑‍💻 *{{repo}}* PR opened on `{{branch}}` — human should drive Antigravity, then review/merge"
+      "id": "codex-on-ready-label",
+      "when": { "events": ["issues", "pull_request"], "actions": ["labeled", "opened"] },
+      "worker": "codex",
+      "authorize": "label"
     }
   ]
 }
