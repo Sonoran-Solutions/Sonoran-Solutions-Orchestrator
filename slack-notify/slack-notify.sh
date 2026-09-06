@@ -68,18 +68,18 @@ build_payload() {
       --arg text "$text" \
       --arg branch "$branch" \
       --arg link "$link" \
-      '{
-        channel: (if $ch == "" then null else $ch end),
-        blocks: [
-          { type: "section", text: { type: "mrkdwn", text: ("*" + $headline + "*") } },
-          { type: "section", text: { type: "mrkdwn", text: $text } },
-          { type: "context",
-            elements: ([
-              (if $branch == "" then null else { type: "mrkdwn", text: ("Branch: `" + $branch + "`") } end),
-              (if $link == "" then null else { type: "mrkdwn", text: ("<" + $link + "|open on GitHub>") } end)
-            ] | map(select(. != null))) }
-        ]
-      }'
+      'def ctx:
+         [ (if $branch == "" then null else { type: "mrkdwn", text: ("Branch: `" + $branch + "`") } end),
+           (if $link == "" then null else { type: "mrkdwn", text: ("<" + $link + "|open on GitHub>") } end) ]
+         | map(select(. != null));
+       {
+         channel: (if $ch == "" then null else $ch end),
+         blocks: (
+           [ { type: "section", text: { type: "mrkdwn", text: ("*" + $headline + "*") } },
+             { type: "section", text: { type: "mrkdwn", text: $text } } ]
+           + (if (ctx | length) > 0 then [ { type: "context", elements: ctx } ] else [] end)
+         )
+       }'
   else
     printf '{"text":"%s"}' "$(printf '%s' "${headline}\n${text}\n${branch}\n${link}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
   fi
