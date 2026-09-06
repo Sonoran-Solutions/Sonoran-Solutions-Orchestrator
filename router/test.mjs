@@ -4,11 +4,11 @@ import { authorize } from './lib/auth.mjs';
 import { normalize } from './lib/events.mjs';
 import { interpolateArgs, runWorker } from './lib/workers.mjs';
 import * as state from './lib/state.mjs';
-import { runGit, createWorktree, removeWorktree } from './lib/worktrees.mjs';
-import { spawn } from 'node:child_process';
+import { runGit, createWorktree, removeWorktree, installPushGuard, resolveGitDir, removeWorktreePath } from './lib/worktrees.mjs';
+import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import http from 'node:http';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -146,6 +146,57 @@ test('worktrees: create + remove an isolated worktree', () => {
   removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'task-1' });
   assert(!runGit(src, ['worktree', 'list']).includes('task-1'), 'worktree removed');
   rmSync(dir, { recursive: true, force: true });
+});
+
+test('worktrees: push guard enforces base-SHA + scope files (ORCH-081/082)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-guard-'));
+  const src = join(dir, 'repo'); const wtRoot = join(dir, 'worktrees');
+  mkdirSync(src); runGit(src, ['init', '-q']); runGit(src, ['config', 'user.email', 't@t']); runGit(src, ['config', 'user.name', 't']);
+  writeFileSync(join(src, 'f.txt'), 'hi'); runGit(src, ['add', 'f.txt']); runGit(src, ['commit', '-qm', 'init']);
+  const sha = runGit(src, ['rev-parse', 'HEAD']).trim();
+  const wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha: sha });
+
+  const baseSha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  installPushGuard(wt, { allowedPaths: ['*'], baseSha });
+  assert(readFileSync(join(wt, '.sonoran-base-sha'), 'utf8').trim() === baseSha, 'base-sha file written');
+
+  const hook = join(resolveGitDir(wt), 'hooks', 'pre-push');
+  const zero = '0000000000000000000000000000000000000000';
+  const moved = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+
+  let r = spawnSync('sh', [hook], { cwd: wt, input: `refs/heads/x ${sha} refs/heads/x ${zero}\n` });
+  assert(r.status === 0, 'new branch (all-zero remote) allowed');
+  r = spawnSync('sh', [hook], { cwd: wt, input: `refs/heads/x ${sha} refs/heads/x ${baseSha}\n` });
+  assert(r.status === 0, 'unchanged base allowed');
+  r = spawnSync('sh', [hook], { cwd: wt, input: `refs/heads/x ${sha} refs/heads/x ${moved}\n` });
+  assert(r.status !== 0, 'moved base blocked');
+  assert(String(r.stderr).includes('branch moved'), 'block message mentions base movement');
+
+  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1' });
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('state: expired lease list + removeWorktreePath + releaseLease (ORCH-083)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-reap-'));
+  const db = state.openDb(join(dir, 's.sqlite'));
+  const src = join(dir, 'repo'); const wtRoot = join(dir, 'worktrees');
+  mkdirSync(src); runGit(src, ['init', '-q']); runGit(src, ['config', 'user.email', 't@t']); runGit(src, ['config', 'user.name', 't']);
+  writeFileSync(join(src, 'f.txt'), 'hi'); runGit(src, ['add', 'f.txt']); runGit(src, ['commit', '-qm', 'init']);
+  const sha = runGit(src, ['rev-parse', 'HEAD']).trim();
+  const wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't2', baseSha: sha });
+
+  state.createLease(db, { id: 'lease-x', taskId: 't2', worktree: wt, baseSha: sha, owner: 'codex', sourceRepo: src, expiresAt: new Date(Date.now() - 1000).toISOString() });
+  const expired = state.listExpiredLeases(db, state.now());
+  assert(expired.length === 1 && expired[0].id === 'lease-x', 'expired lease listed');
+  assert(expired[0].source_repo === src, 'lease records source repo');
+
+  removeWorktreePath(src, wt);
+  assert(!runGit(src, ['worktree', 'list']).includes('t2'), 'expired worktree removed');
+
+  state.releaseLease(db, 'lease-x');
+  assert(state.listExpiredLeases(db, state.now()).length === 0, 'released lease no longer expired');
+
+  state.close(db); rmSync(dir, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------- injection (ORCH-058..061)

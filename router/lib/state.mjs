@@ -44,13 +44,14 @@ function init(db) {
       result     TEXT
     );
     CREATE TABLE IF NOT EXISTS leases (
-      id         TEXT PRIMARY KEY,
-      task_id    TEXT NOT NULL,
-      worktree   TEXT NOT NULL,
-      base_sha   TEXT,
-      owner      TEXT,
-      status     TEXT NOT NULL,
-      expires_at TEXT
+      id          TEXT PRIMARY KEY,
+      task_id     TEXT NOT NULL,
+      worktree    TEXT NOT NULL,
+      base_sha    TEXT,
+      owner       TEXT,
+      source_repo TEXT,
+      status      TEXT NOT NULL,
+      expires_at  TEXT
     );
   `);
 }
@@ -97,10 +98,10 @@ export function updateRun(db, id, { status, result }) {
 }
 
 export function createLease(db, lease) {
-  db.prepare(`INSERT INTO leases (id, task_id, worktree, base_sha, owner, status, expires_at)
-              VALUES (?,?,?,?,?,?,?)`)
+  db.prepare(`INSERT INTO leases (id, task_id, worktree, base_sha, owner, source_repo, status, expires_at)
+              VALUES (?,?,?,?,?,?,?,?)`)
     .run(lease.id, lease.taskId, lease.worktree, lease.baseSha ?? null, lease.owner ?? null,
-         lease.status || 'active', lease.expiresAt ?? null);
+         lease.sourceRepo ?? null, lease.status || 'active', lease.expiresAt ?? null);
 }
 
 export function getActiveLeaseForTask(db, taskId) {
