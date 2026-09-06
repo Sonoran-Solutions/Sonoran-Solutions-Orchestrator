@@ -1,256 +1,133 @@
 # Sonoran router
 
-The router is the **deterministic control plane** for the Sonoran Solutions agent workflow.
+The **deterministic control plane** for the Sonoran Solutions agent workflow.
+It owns boring, mechanical orchestration facts and never asks a model to decide
+whether a webhook is trusted.
 
-The current `server.mjs` is prototype relay scaffolding. It demonstrates event → target dispatch, but it must **not** be treated as production-safe or exposed to untrusted/public webhook traffic with code-execution authority in its current form.
+See [`../AGENT_ORCHESTRATION_PLAN.md`](../AGENT_ORCHESTRATION_PLAN.md) for the
+architecture/trust model, [`../IMPLEMENTATION_ROADMAP.md`](../IMPLEMENTATION_ROADMAP.md)
+for ordering, and [`../handoff/handoff-envelope.md`](../handoff/handoff-envelope.md)
+for the task schema.
 
-See:
+## Layout
 
-- [`../AGENT_ORCHESTRATION_PLAN.md`](../AGENT_ORCHESTRATION_PLAN.md) for the architecture and trust model.
-- [`../IMPLEMENTATION_ROADMAP.md`](../IMPLEMENTATION_ROADMAP.md) for the implementation order.
-- [`../handoff/handoff-envelope.md`](../handoff/handoff-envelope.md) for the task schema.
-
-## What the router should own
-
-The router owns boring, deterministic orchestration facts:
-
-- webhook authentication;
-- trusted-task authorization;
-- delivery deduplication;
-- task/run state;
-- worker leases;
-- branch/base SHA tracking;
-- worktree ownership;
-- attempt/time/concurrency limits;
-- handoff-envelope validation;
-- worker dispatch;
-- cancellation/escalation;
-- concise state notifications.
-
-It should **not** ask a model to decide whether a webhook is trusted or which process may be executed.
-
-## What the router should not own
-
-- Product decisions.
-- Architecture decisions.
-- Model reasoning/debugging.
-- The authoritative CI result.
-- Slack conversation history as task state.
-- A shared dirty working tree.
-
-GitHub remains the durable work record. SQLite should hold runtime orchestration state. GitHub Actions remains the independent required-check authority.
-
-## Target architecture
-
-```text
-signed GitHub event
-        │
-        ▼
-normalize + dedupe
-        │
-        ▼
-authorization policy
-        │
-        ▼
-validate task/envelope
-        │
-        ▼
-SQLite transaction
-(task/run/lease state)
-        │
-        ▼
-create/confirm isolated worktree lease
-        │
-        ▼
-dispatch fixed executable + validated args
-        │
-        ├── Codex
-        ├── Antigravity (human-steered initially)
-        ├── Hermes
-        └── DeepSeek specialist workflow
+```
+router/
+  server.mjs            HTTP entry: HMAC, body limit, dedupe, auth, dispatch, shutdown
+  lib/config.mjs        config loading (outside the repo; secrets via env)
+  lib/events.mjs        normalized event context + template vars
+  lib/handoff.mjs       handoff envelope parser/validator + state machine
+  lib/auth.mjs          trusted-actor / agent:ready authorization gate
+  lib/state.mjs         SQLite state (tasks/runs/deliveries/leases)
+  lib/workers.mjs       fixed-executable dispatch (shell:false, timeout)
+  lib/worktrees.mjs     per-task git worktrees + lease + push guard
+  test.mjs              test suite (node test.mjs)
 ```
 
-## Required event context
+## What is implemented (ORCH-050…083)
 
-Before routing, normalize the webhook into a small internal object containing at least:
+| Area | Status |
+|---|---|
+| Normalized event context (delivery id, event/action, repo, issue/PR, actor, branch, head/base SHA, labels) | ✅ |
+| Request-body size limit, worker timeout, concurrency limit, graceful shutdown | ✅ |
+| Mandatory HMAC signature verification (rejects missing/invalid; `devMode` is the only opt-out) | ✅ |
+| GitHub delivery-id dedupe (idempotent) | ✅ |
+| Safe dispatch: fixed `program` + argv template, `shell: false`, no webhook-derived shell strings | ✅ |
+| Authorization gate: trusted-actor allowlist and `agent:ready` label (labeler must be trusted) | ✅ |
+| SQLite `tasks`, `runs`, `deliveries`, `leases` (state survives restart) | ✅ |
+| Handoff envelope parser/validator (`schema_version: 1`, required fields, legal transitions) | ✅ |
+| Per-task git worktree + lease + allowed-path pre-push guard | ✅ (create/reap/guard) |
+| Tests: 15 passing (`node test.mjs`) | ✅ |
 
-```text
-delivery_id
-webhook_event
-webhook_action
-repo
-issue_or_pr_number
-actor
-branch
-head_sha
-base_sha
-labels
-authorization_facts
-```
+A random public issue/PR **cannot** launch a worker: it needs a valid signature,
+an untrusted actor is rejected, a code-editing dispatch additionally needs a
+valid handoff envelope, and the `agent:ready` path requires a trusted labeler.
 
-Do not overload a commit SHA field to represent an issue number. Task identity should be explicit.
+## Not yet implemented (do not rely on these)
 
-## Authorization
+- **Base-SHA movement check at push time** (ORCH-081): the router records
+  `base_sha`, but the "stop if the branch moved unexpectedly" check is not wired
+  into a pre-push gate yet. GitHub Rulesets (TOOL-021+) are the intended
+  independent backstop.
+- **Automatic stale-lease reaping** (ORCH-083): `listExpiredLeases` exists, but
+  there is no periodic reaper; expired worktrees must be removed manually or via
+  a cron for now.
+- **Body-limit / concurrency / timeout paths** are implemented but not yet
+  covered by an automated test.
+- **GitHub Actions as the required-check authority** and **Hermes repair** are
+  M2 (see the roadmap) — not part of this control-plane milestone.
 
-A syntactically valid GitHub event is not enough to launch a worker.
+## Configuration
 
-Initial recommended policy:
+Config is loaded from the first of:
 
-1. webhook signature is valid;
-2. delivery ID has not already been processed;
-3. repo is allowlisted;
-4. actor is trusted **or** a trusted actor applied an `agent:ready` label;
-5. task/envelope validates;
-6. requested worker/action is allowed for the task's current state.
+1. `$CONFIG_PATH`
+2. `router/config.local.json`
+3. `~/.config/sonoran/router.json`
+4. `router/config.example.json` (committed, no secrets — dev fallback)
 
-A random public issue opening must never satisfy this policy by itself.
-
-## Safe dispatch
-
-The current prototype uses interpolated shell commands. Replace that before unattended execution.
-
-### Do not
-
-```text
-command = "codex exec \"...{{sender}}...{{branch}}...\""
-spawn(command, { shell: true })
-```
-
-### Prefer
-
-```text
-executable = configured constant
-args       = [validated, structured, values]
-shell      = false
-```
-
-Webhook/task text may be passed to a worker as untrusted prompt/context, but it may not choose the executable, shell syntax, secret path, working directory, or routing policy.
-
-## SQLite state
-
-Recommended minimum tables:
-
-### `tasks`
-
-- `task_id`
-- `repo`
-- `issue_number`
-- `state`
-- `risk`
-- `current_owner`
-- `branch`
-- `base_sha`
-- timestamps
-
-### `runs`
-
-- `run_id`
-- `task_id`
-- `agent`
-- `attempt`
-- `status`
-- start/end timestamps
-- last result/error
-
-### `deliveries`
-
-- GitHub delivery ID (unique)
-- event/action
-- received/processed timestamps
-- result
-
-### `leases`
-
-- task/run ID
-- agent
-- worktree path
-- branch/base SHA
-- expiry
-- allowed-path scope
-
-A duplicate delivery should return success/idempotent status without launching a second worker.
-
-## Worktree model
-
-The router should allocate/track an isolated git worktree per execution lease, for example:
-
-```text
-/worktrees/dualdex/issue-123-antigravity/
-/worktrees/dualdex/issue-141-hermes/
-```
-
-Before commit/push, verify:
-
-- lease is still active;
-- expected branch/base SHA still matches policy;
-- modified paths remain within `allowed_paths`.
-
-Unexpected movement or scope expansion should stop/escalate the run.
-
-## Operational limits
-
-Implement hard bounds before autonomous workers:
-
-- request-body size;
-- worker runtime timeout;
-- max attempts;
-- max concurrent runs per repo/task;
-- cancellation;
-- stale-lease expiration/reaping;
-- log retention.
-
-No infinite retry loops.
-
-## Slack
-
-The router may emit project/ops notifications, but Slack is not task state.
-
-Default messages should be state transitions only:
-
-- started/assigned;
-- ready for verification;
-- blocked/escalated;
-- completed/merged;
-- stopped.
-
-Avoid one message per file edit/tool call.
-
-## DeepSeek Harness
-
-DeepSeek Harness can be a powerful worker/specialist-swarm layer, but the initial router should not delegate durable state, authorization, dedupe, or leases to it.
-
-If DSH receives a webhook directly for a future specialist workflow, make sure that event has already passed the same authorization/task policy or that DSH is itself behind an equivalent trusted gate. Do not create two independent routers for the same action.
-
-## Current prototype gaps
-
-Before unattended use, `server.mjs` still needs the following work:
-
-- [ ] replace `shell: true` dispatch;
-- [ ] explicit issue/PR/task IDs;
-- [ ] handoff-envelope parser + schema validation;
-- [ ] trusted authorization gate;
-- [ ] mandatory signature verification outside local-dev mode;
-- [ ] GitHub delivery dedupe;
-- [ ] SQLite task/run/delivery/lease state;
-- [ ] request/body limits;
-- [ ] worker timeouts;
-- [ ] concurrency limits;
-- [ ] cancellation;
-- [ ] isolated worktree allocation;
-- [ ] base-SHA/lease validation;
-- [ ] allowed-path enforcement;
-- [ ] external orchestration-owned secret/config handling.
-
-These tasks are broken down and ordered in [`../IMPLEMENTATION_ROADMAP.md`](../IMPLEMENTATION_ROADMAP.md).
-
-## Local prototype use
-
-For manual/local experiments only, the existing relay can still be useful as scaffolding:
+Secrets never live in config: the webhook secret is read from
+`$GITHUB_WEBHOOK_SECRET` (configurable via `githubSecretEnv`) and the Slack
+webhook from `$SLACK_WEBHOOK_URL` (`slackWebhookEnv`).
 
 ```bash
 cd router
-cp config.example.json config.local.json
-node server.mjs
+cp config.example.json config.local.json   # edit ports/paths/allowlist/rules
+GITHUB_WEBHOOK_SECRET=... SLACK_WEBHOOK_URL=... node server.mjs
 ```
 
-Keep it on a trusted local network while the safety/control-plane work is incomplete. Do not treat the example config as a secure production configuration.
+### Workers (fixed executables)
+
+```jsonc
+"workers": {
+  "codex": { "program": "codex", "args": ["exec", "--full-auto", "{{prompt}}"],
+             "createsTask": true, "allowedPaths": ["app/src/**"] },
+  "notify": { "program": "../slack-notify/slack-notify.sh",
+              "args": ["pr-ready", "{{task}}", "--link", "{{link}}"] }
+}
+```
+
+`program` is a fixed path (or a PATH command); `args` are template strings.
+Interpolation uses only the normalized context (`{{repo}}`, `{{branch}}`,
+`{{task}}`, `{{link}}`, `{{prompt}}`, `{{worktree}}`…), never raw body text.
+`createsTask: true` marks a worker as code-editing: it requires a valid handoff
+envelope and gets an isolated worktree + lease.
+
+### Rules
+
+```jsonc
+"rules": [
+  { "id": "pr-opened-notify", "when": { "events": ["pull_request"], "actions": ["opened"] },
+    "worker": "notify", "authorize": "trusted" },
+  { "id": "codex-on-ready-label", "when": { "events": ["issues"], "actions": ["labeled"] },
+    "worker": "codex", "authorize": "label" }
+]
+```
+
+`authorize: "trusted"` requires `actor ∈ allowlist`; `authorize: "label"`
+requires a trusted actor **and** the `agent:ready` label.
+
+## GitHub webhook wiring
+
+Repo → Settings → Webhooks → **Add webhook**:
+
+- Payload URL: `http://<your-ip>:8090/github` (any path)
+- Content type: `application/json`
+- Secret: the same value as `$GITHUB_WEBHOOK_SECRET`
+- Events: `pull_request`, `issues`, `issue_comment` (as needed)
+
+Keep it on a trusted network. Do not expose the router publicly; the HMAC gate
+is for authenticity, not a replacement for a private network + Rulesets.
+
+## Tests
+
+```bash
+cd router
+node test.mjs
+```
+
+Covers handoff parsing/validation (valid, missing, unknown schema, malicious,
+lists/block-scalars, state transitions), authorization, event normalization,
+SQLite dedupe/round-trip, worktree create/reap, shell-injection safety, and a
+full HTTP integration flow (HMAC 401, untrusted 403, notify dispatch, dedupe,
+and the invalid-envelope 422 gate).
