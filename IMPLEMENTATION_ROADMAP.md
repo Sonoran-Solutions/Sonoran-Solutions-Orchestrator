@@ -326,9 +326,49 @@ Create controlled failures rather than trusting the first real incident.
 - [ ] **ORCH-142** Required GitHub Actions checks gate completion.
 - [ ] **ORCH-143** Human merge marks the initial M3 task `done`.
 
+## M3.4 — Capability-tier model router
+
+**Goal:** turn the policy in [`MODEL_ROUTING.md`](MODEL_ROUTING.md) into deterministic, provider-neutral routing behavior. The router should choose the cheapest capable worker, preserve evidence between attempts, escalate only for a reason, and step back down once the hard unknown is resolved.
+
+- [ ] **ORCH-144** Extend task/run metadata and the handoff schema with provider-neutral routing fields such as:
+  - `work_class`;
+  - `capability_tier`;
+  - `max_capability_tier`;
+  - `preferred_worker` / optional provider preference;
+  - `fallback_tier`;
+  - `evidence_packet_ref`;
+  - budget and human-approval requirements where applicable.
+- [ ] **ORCH-145** Add a configurable model/worker registry mapping capability tiers to the currently available providers, models, harnesses, tool access, and cost policy. Durable task state must describe required capability rather than hard-code a permanent model name.
+- [ ] **ORCH-146** Implement a deterministic routing decision engine that selects the cheapest allowed worker satisfying the task's capability tier, work class, repository policy, required tools, availability, and configured budget.
+- [ ] **ORCH-147** Implement structured escalation packets. Before moving a task to a higher capability tier, preserve at least:
+  - the original question/acceptance criteria;
+  - confirmed facts and collected evidence;
+  - commands/tests already run and their important results;
+  - attempted hypotheses/fixes and why they failed;
+  - relevant logs, traces, diffs, artifacts, or research notes;
+  - the specific unresolved question the higher tier should attack.
+- [ ] **ORCH-148** Implement bounded escalation and step-down policy:
+  - do not escalate merely because a task is large;
+  - require evidence-producing attempts or an explicit research-class trigger;
+  - respect `max_capability_tier` and human approval/budget gates;
+  - after a Tier 4 research run resolves the unknown, route ordinary implementation/tests/docs back to Tier 2 or Tier 1 instead of leaving the premium model attached indefinitely.
+- [ ] **ORCH-149** Add routing regression tests covering at least:
+  - Tier 1 routine work stays on Tier 1;
+  - Tier 2 receives normal serious engineering work;
+  - repeated evidence-producing Tier 2 failures can promote to Tier 3;
+  - research-class/undocumented-system work can reach Tier 4 under policy;
+  - provider outage selects an allowed equivalent/fallback without corrupting task state;
+  - budget caps and human-approval requirements block unauthorized premium escalation;
+  - a resolved Tier 4 research task steps back down for implementation;
+  - capability tier never grants broader repository, secret, hardware, merge, or authorization permissions.
+
 ### M3 exit criteria
 
 One real DualDex issue can move from authorized plan → implementation → review → CI → human merge with durable state and no ambiguous ownership.
+
+At least one controlled pilot task can also be classified and routed through the capability ladder with a durable evidence packet, deterministic escalation/step-down behavior, and no provider/model name acting as the source of truth for task state.
+
+**GATE:** do not enable automatic premium-model escalation until routing tests, budget limits, evidence handoffs, and any required human approval gates have been exercised deliberately.
 
 ---
 
