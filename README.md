@@ -21,6 +21,16 @@ The goal is **not** to build an autonomous fake company for its own sake. The go
 
 **Neutral bus:** GitHub remains the durable work record. The router owns runtime policy/state. No model vendor is the source of truth.
 
+### Cost-aware model routing
+
+Agent roles and model capability are separate concerns. Sonoran Solutions uses a capability ladder so routine work stays on economical models and expensive research models are reserved for genuinely unresolved problems.
+
+> **Core rule:** Astra should usually receive evidence produced by cheaper models rather than being asked to gather all of the evidence itself.
+
+The current ladder runs from Flash-tier reconnaissance/mechanical work → Terra for normal serious engineering → DeepSeek Pro for hard problems/second opinions → Astra for bounded research and experimental reverse engineering. The durable architecture is **capability-tier based**, not tied to a permanent vendor or model name.
+
+See [`MODEL_ROUTING.md`](MODEL_ROUTING.md) for model selection, escalation triggers, evidence-first handoffs, step-down rules, and examples across Sonoran projects.
+
 ## Supporting Sonoran toolchain
 
 The orchestrator is only one layer of the broader development workflow. Each supporting tool gets one clear responsibility:
@@ -70,6 +80,7 @@ See [`TOOLING_STACK.md`](TOOLING_STACK.md) for boundaries/integration rules and 
 | Path | Purpose |
 |---|---|
 | [`AGENT_ORCHESTRATION_PLAN.md`](AGENT_ORCHESTRATION_PLAN.md) | Full architecture, authority model, trust boundaries, state machine, CI/review flow, and rollout strategy |
+| [`MODEL_ROUTING.md`](MODEL_ROUTING.md) | Cost-aware model ladder, escalation/step-down policy, evidence-first handoffs, and vendor-neutral capability routing |
 | [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) | Core phased checklist from manual DualDex pilot through safe automation |
 | [`TOOLING_STACK.md`](TOOLING_STACK.md) | Supporting tools: Linear, Rulesets, 1Password, Sentry, Tailscale, Renovate, Taskfile, and parked Dagger option |
 | [`TOOLING_ROADMAP.md`](TOOLING_ROADMAP.md) | Parallel `TOOL-###` adoption tasks aligned to the core orchestrator phases |
@@ -148,7 +159,7 @@ Use the proven system on SaveBridge, then later on Dungeon Dispatcher where appr
 
 Dagger remains parked until local/hosted CI divergence becomes a demonstrated problem.
 
-See [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) for the core implementation gates and [`TOOLING_ROADMAP.md`](TOOLING_ROADMAP.md) for the parallel supporting-tool checklist.
+See [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) for the core implementation gates, [`TOOLING_ROADMAP.md`](TOOLING_ROADMAP.md) for the parallel supporting-tool checklist, and [`MODEL_ROUTING.md`](MODEL_ROUTING.md) for the model escalation policy used by workers.
 
 ## Current prototype caveats
 
