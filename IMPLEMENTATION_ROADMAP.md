@@ -405,6 +405,33 @@ At least one controlled pilot task can also be classified and routed through the
 - [ ] **ORCH-165** Add stuck-run detection.
 - [ ] **ORCH-166** Add provider/model failure classification and clean escalation.
 
+## M4.5 — Model usage & capacity hub
+
+**Goal:** give humans and the capability-tier router one normalized, near-real-time view of which model capacity is actually available. See [`MODEL_USAGE_HUB.md`](MODEL_USAGE_HUB.md) for the design.
+
+- [ ] **ORCH-167** Build provider-capacity adapters and a normalized capacity snapshot schema covering configured models/workers. Capture authoritative quota/usage when providers expose it, plus availability, rate-limit state, reset windows, billing/budget data when useful, and provenance fields such as `observed_at`, freshness, source, and quality. Where exact quota is unavailable, support clearly labeled derived/estimated/manual values instead of inventing precision.
+- [ ] **ORCH-168** Build the human-facing usage hub and persistence layer:
+  - current availability/capacity grouped by capability tier;
+  - remaining quota/usage and reset countdowns where known;
+  - rate-limit state;
+  - current task/run reservations;
+  - usage history by model, repo, task, and work class;
+  - configured budget/reserve thresholds;
+  - stale/failed telemetry warnings;
+  - concise alerts when premium capacity is low, providers become unavailable, or quota resets make blocked work runnable again.
+- [ ] **ORCH-169** Integrate capacity into deterministic routing policy:
+  - prefer the cheapest capable worker that also has sufficient fresh capacity;
+  - protect configurable Tier 3/Tier 4 reserve thresholds;
+  - never silently downgrade below required capability just to save quota;
+  - queue/block or require human approval when no eligible worker has enough capacity;
+  - add short-lived capacity reservations so concurrent tasks do not all spend the same apparent remaining quota;
+  - treat stale/unknown usage as uncertainty rather than as an exact remaining percentage;
+  - add regression tests proving capacity affects worker selection but never expands repository, secret, hardware, merge, or authorization permissions.
+
+### M4 exit criteria
+
+The operations layer provides a trustworthy view of active work and configured model capacity. A human can see model availability/usage in one place, and the router can make auditable capacity-aware choices without relying on fabricated quota precision or provider-specific task semantics.
+
 ---
 
 # Phase M5 — Expand beyond the pilot
