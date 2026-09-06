@@ -17,7 +17,7 @@ import { parseEnvelope } from './lib/handoff.mjs';
 import { authorize } from './lib/auth.mjs';
 import * as state from './lib/state.mjs';
 import { resolveProgram, interpolateArgs, runWorker } from './lib/workers.mjs';
-import { ensureRepo, createWorktree, installPushGuard } from './lib/worktrees.mjs';
+import { ensureRepo, createWorktree, installPushGuard, removeWorktreePath } from './lib/worktrees.mjs';
 
 const cfg = loadConfig();
 const PORT = cfg.port || 8090;
@@ -92,11 +92,15 @@ async function dispatch(rule, ctx) {
     state.createRun(db, { id: runId, taskId, agent: rule.worker, attempt: 1, status: 'running' });
 
     const sourceRepo = ensureRepo(ctx.repo, cfg.reposRoot);
+    const baseSha = ctx.baseSha || ctx.headSha;
     worktree = createWorktree({
-      sourceRepo, worktreeRoot: cfg.worktreeRoot, taskId, baseSha: ctx.baseSha || ctx.headSha,
+      sourceRepo, worktreeRoot: cfg.worktreeRoot, taskId, baseSha,
     });
-    installPushGuard(worktree, workerCfg.allowedPaths || []);
-    state.createLease(db, { id: crypto.randomUUID(), taskId, worktree, baseSha: ctx.baseSha || ctx.headSha, owner: envelope.agent });
+    installPushGuard(worktree, { allowedPaths: workerCfg.allowedPaths || [], baseSha });
+    state.createLease(db, {
+      id: crypto.randomUUID(), taskId, worktree, baseSha, owner: envelope.agent,
+      sourceRepo, expiresAt: new Date(Date.now() + (cfg.leaseDurationMs || 86400000)).toISOString(),
+    });
   }
 
   const vars = templateVars(ctx, {
@@ -201,6 +205,25 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => log(`[router] listening on :${PORT} using ${cfg.__path}`));
+
+// Periodic stale-lease reaper (ORCH-083): remove expired worktrees + release leases.
+function reapExpired() {
+  let reaped = 0;
+  for (const lease of state.listExpiredLeases(db, state.now())) {
+    try {
+      removeWorktreePath(lease.source_repo, lease.worktree);
+      state.releaseLease(db, lease.id);
+      log(`[router] reaped expired lease ${lease.id} (${lease.worktree})`);
+      reaped++;
+    } catch (e) {
+      log(`[router] reap failed for ${lease.id}: ${e.message}`);
+    }
+  }
+  if (reaped) log(`[router] reaped ${reaped} expired lease(s)`);
+}
+if (cfg.reapIntervalMs && cfg.reapIntervalMs > 0) {
+  setInterval(reapExpired, cfg.reapIntervalMs).unref();
+}
 
 function shutdown(signal) {
   if (shuttingDown) return;

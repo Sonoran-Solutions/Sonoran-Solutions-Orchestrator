@@ -5,6 +5,8 @@
   "defaultTimeoutMs": 120000,
   "maxConcurrency": 2,
   "shutdownGraceMs": 8000,
+  "leaseDurationMs": 86400000,
+  "reapIntervalMs": 300000,
   "githubSecretEnv": "GITHUB_WEBHOOK_SECRET",
   "slackWebhookEnv": "SLACK_WEBHOOK_URL",
   "stateDb": "state.sqlite",
