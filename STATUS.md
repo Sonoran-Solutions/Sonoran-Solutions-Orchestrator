@@ -8,10 +8,22 @@ or code-editing authority (that stays gated on M2 + Rulesets + human merge).
 
 - **ORCH-003** — stale `devils-17` → `Sonoran-Solutions` links fixed in
   `dualdex/README.md` (2 occurrences). Orchestrator repo has no other stale refs.
-- **ORCH-005/006/007** — pilot issue proposed + acceptance criteria + baseline
-  workflow: [`pilot/dualdex-pilot-issue.md`](pilot/dualdex-pilot-issue.md).
-  **Awaiting human confirmation of the issue (and ROM data if Candidate A).**
+- **ORCH-005/006/007** — pilot issue confirmed and implemented: Pokemon Unbound
+  ROM-hack profile (`app/src/main/assets/profiles/unbound.json`), native C offsets
+  and detection in `pokemon_reader.c` / `pokemon_reader.h`, merged into DualDex
+  `main` via PR #21.
 - **ORCH-011** — planning-pass artifact: [`pilot/planning-pass.md`](pilot/planning-pass.md).
+- **ORCH-014/018 (M0.2 Antigravity Build Verification)**:
+  - Antigravity executed `./ci.sh test`: 8/8 native C tests passed, 23/23 Gradle unit tests passed.
+  - Antigravity executed `./ci.sh build`: successfully assembled debug APK (`app-debug.apk`, 16.8 MB).
+  - Resolved `native/quickjs` submodule mapping in `.gitmodules` and auto-initialization in `ci.sh`.
+- **ORCH-090/091 (M2.1 Canonical CI Contract & GitHub Actions)**:
+  - Added canonical `./ci.sh` in DualDex (PR #22).
+  - Added `.github/workflows/ci.yml` for DualDex to enforce required test checks on PRs/pushes.
+- **Antigravity Customizations & Rules**:
+  - Added `AGENTS.md` to `dualdex` defining agent roles, build contract, and handoff protocols.
+  - Added `AGENTS.md` to `sso-orchestrator` defining control plane safety and Slack notification policy.
+  - Added `.agents/skills/sonoran-orchestrator/SKILL.md` for seamless agent execution.
 - **ORCH-034/035** — `slack-notify.sh` now posts only state transitions
   (`task-started`, `pr-ready`, `blocked`, `done`, `stopped`); per-tool/per-file
   spam removed; `hooks.json` emptied.
@@ -29,13 +41,8 @@ or code-editing authority (that stays gated on M2 + Rulesets + human merge).
 
 ## Not yet done (needs a human / next milestone)
 
-- **ORCH-005** final issue confirmation (human decision).
-- **ORCH-001/002/004** remaining identity checks: GitHub Actions, badges,
-  remotes, Slack links, tokens — verify once integrations are actually wired.
-- **M0 manual passes** (ORCH-010…019): Codex plan, human-steered Antigravity
-  implementation, Codex review — driven by the human, not this session.
-- **M2** (ORCH-090…110): define `ci.sh` for DualDex, add GitHub Actions required
-  checks, install Hermes, run deliberate-failure tests.
+- **Slack Webhook Rotation**: Previous webhook URL was revoked by Slack policy (HTTP 403); fresh webhook URL needed in `~/.config/sonoran/orchestrator.env`.
+- **ORCH-016/017 (M0.3 Review Pass)**: Codex review of the merged Unbound diff (PR #21) against acceptance criteria.
 - **ORCH-081/083** (router): push-time base-SHA movement check + automatic
   stale-lease reaping are recorded but not yet wired into a periodic gate.
 - **TOOL-021…029**: GitHub Rulesets on DualDex (required checks + review gate).
