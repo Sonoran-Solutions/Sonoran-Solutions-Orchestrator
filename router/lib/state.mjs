@@ -140,6 +140,39 @@ export function getActiveLeaseForTask(db, taskId) {
     .get(taskId);
 }
 
+// The most recent RUN for the task that is still marked 'running'. Used together
+// with an active lease as the router's live-execution ownership signal.
+export function getRunningRunForTask(db, taskId) {
+  return db.prepare(`SELECT * FROM runs WHERE task_id = ? AND status = 'running' ORDER BY rowid DESC LIMIT 1`)
+    .get(taskId);
+}
+
+// A lease is "expired" once its expires_at is in the past. A NULL expires_at means
+// it never expires, so it is treated as live (we never clobber what we cannot prove
+// is dead).
+export function isLeaseExpired(lease, atIso = null) {
+  if (!lease || !lease.expires_at) return false;
+  return String(lease.expires_at) < (atIso || now());
+}
+
+// The current live-execution state for a task (used by dispatch before any lease or
+// worktree mutation). `live` is true only when there is BOTH a run still marked
+// 'running' AND an active lease that is not yet expired. If either is missing, the
+// previous execution can be reconciled/recovered rather than treated as live.
+export function activeExecutionState(db, taskId, atIso = null) {
+  const runningRun = getRunningRunForTask(db, taskId);
+  const activeLease = getActiveLeaseForTask(db, taskId);
+  const live = !!(runningRun && activeLease && !isLeaseExpired(activeLease, atIso));
+  return { live, runningRun, activeLease };
+}
+
+// Mark a run abandoned/stopped (used to reconcile a stale "running" run before a
+// controlled recovery). `abandoned` is a documented, non-terminal run status.
+export function markRunAbandoned(db, id, reason = '') {
+  db.prepare('UPDATE runs SET status = ?, result = ?, ended_at = ? WHERE id = ?')
+    .run('abandoned', reason || null, now(), id);
+}
+
 // Re-delivery must never leave two active leases for the same task/worktree:
 // release any existing active lease(s) for the task before a fresh one is made.
 export function releaseActiveLeasesForTask(db, taskId) {

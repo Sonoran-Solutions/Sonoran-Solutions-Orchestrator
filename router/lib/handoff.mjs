@@ -168,3 +168,19 @@ export function validateNewTaskState(state) {
 export function canEnterInProgress(existingState) {
   return existingState === 'in_progress' || legalTransition(existingState, 'in_progress');
 }
+
+// For an EXISTING task, the handoff envelope's declared state must agree with the
+// persisted router state before the router performs its own deterministic transition
+// into `in_progress`. We fail closed on disagreement rather than auto-reconciling.
+// Examples: blocked+blocked / review+review agree; blocked+done / review+planned
+// disagree and are refused; done+done agrees but is terminal (see canEnterInProgress).
+export function validateExistingTaskState(existing, envelope) {
+  const errors = [];
+  if (!existing || !envelope) return { ok: false, errors: ['missing existing task or envelope'] };
+  const persisted = String(existing.state);
+  const declared = String(envelope.state ?? '');
+  if (declared !== persisted) {
+    errors.push(`envelope state '${declared}' does not match persisted task state '${persisted}'`);
+  }
+  return { ok: errors.length === 0, errors };
+}

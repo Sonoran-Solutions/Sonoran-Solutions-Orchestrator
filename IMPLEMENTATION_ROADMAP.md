@@ -221,9 +221,10 @@ This phase is intentionally before Hermes/autonomous handoffs.
 - [x] **ORCH-079** Record worktree path + base SHA + owner in SQLite. (`leases` table)
 - [ ] **ORCH-080** Verify lease ownership before commit/push. (still open: the pre-push guard is a *cooperative* layer and does not yet confirm the pusher holds the active lease; router-owned push verification does not exist)
 - [x] **ORCH-081** Stop/escalate if the branch moved unexpectedly. (pre-push guard compares the live remote base tip against the recorded base SHA, independent of the pushed ref; `resolveBaseSha` tracks the live remote tip and refuses a stale provided base)
-- [x] **ORCH-082** Enforce `allowed_paths` before commit/push. (worker baseline AND task scope enforced per file; task cannot widen the worker baseline)
+- [x] **ORCH-082** Enforce `allowed_paths` before commit/push. (worker/repository baseline REQUIRED AND optional task scope enforced per file; task cannot widen the worker baseline; an omitted task scope means worker-baseline-only, and a stale task-scope file is removed)
 - [x] **ORCH-083** Clean/reap expired worktrees safely. (periodic `reapExpired()` in `server.mjs`; a stale lease never reaps a worktree a newer active lease owns)
 - [x] **ORCH-140 (lifecycle groundwork)** Retries reconstruct a clean worktree from authoritative Git state (`prepareWorktreeForRun`); incompatible remote task branches fail closed rather than auto-rebasing. (full M3.3 review/verification automation remains)
+- [x] **Single live execution per task** — a delivery that finds a run still `running` + an active, unexpired lease is refused (`task already has an active execution`) and never releases the lease/worktree/launches a second worker; stale `running` runs are reconciled to `abandoned`. Serialized per task with an in-process lock. The handoff envelope's `state` must equal persisted task state for existing tasks (fail closed on mismatch).
 
 ### M1.5 exit criteria
 

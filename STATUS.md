@@ -20,7 +20,7 @@ or code-editing authority (that stays gated on M2 + Rulesets + human merge).
 - **ORCH-037/038/039** — Slack config moved outside worktrees
   (`~/.config/sonoran/orchestrator.env`), loaded as plain `KEY=VALUE` and never
   sourced/evaluated as Bash (verified with an injection test).
-- **ORCH-050…083 (control plane)** — router rebuilt and **tested (37/37)**:
+- **ORCH-050…083 (control plane)** — router rebuilt and **tested (41/41)**:
   - normalized event context (incl. base ref); body limit, timeout, concurrency,
     clean shutdown;
   - mandatory HMAC + delivery dedupe;
@@ -57,10 +57,23 @@ or code-editing authority (that stays gated on M2 + Rulesets + human merge).
   `allowed_paths`, and (a) PR-head-branch equality when the event carries a branch
   are validated against the event context and the resolved base SHA. Mismatches
   refuse the dispatch.
-- **Two-scope path policy** — worker/repository baseline is the MAXIMUM trusted
-  boundary; the envelope's task `allowed_paths` is an optional ADDITIONAL narrowing
-  boundary. A changed file must satisfy BOTH when both exist; a task `*` can never
-  widen the worker baseline. An empty worker baseline fails closed.
+- **Two-scope path policy** — worker/repository baseline is the REQUIRED MAXIMUM
+  trusted boundary; the envelope's task `allowed_paths` is an optional ADDITIONAL
+  narrowing boundary. A changed file must satisfy BOTH when both exist; a task `*`
+  can never widen the worker baseline; **an omitted task scope means
+  worker-baseline-only (never deny-all)**, and a stale task-scope file is removed
+  when a later run supplies no task scope. An empty worker baseline fails closed.
+- **Single live execution per task** — a delivery that finds a run still marked
+  `running` AND an active, unexpired lease is refused (`task already has an active
+  execution`) and does NOT release the lease, delete the worktree, or launch a
+  second worker. A stale `running` run (expired/no lease) is reconciled to
+  `abandoned` and its stale lease released before a controlled recovery. The
+  reservation section is serialized per task with an in-process lock so two
+  near-simultaneous deliveries cannot both reserve execution. Regression-tested with
+  a live sleeping worker over the real HTTP path.
+- **Existing-task state agreement** — for an existing task the handoff envelope's
+  `state` must equal the persisted task state; a mismatch fails closed (rather than
+  auto-reconciling). `done` stays terminal.
 - **Single active lease** — re-delivery releases prior active leases first; a
   stale lease never reaps a worktree a newer active lease still owns.
 - **Retry reconstructs clean state** — each new attempt rebuilds the worktree from
@@ -75,6 +88,8 @@ or code-editing authority (that stays gated on M2 + Rulesets + human merge).
 - **Fail-closed worktree branch** — `createWorktree` never silently falls back to
   a detached HEAD; if the named branch cannot be created/attached, the dispatch
   fails closed.
+- **Cleanup** — the obsolete `fetchLatest()` (`git fetch origin --all`) helper was
+  removed; base refresh now uses `git fetch --prune origin` in `resolveBaseSha`.
 
 ## Not yet done (needs a human / next milestone)
 

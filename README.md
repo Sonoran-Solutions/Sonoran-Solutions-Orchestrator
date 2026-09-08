@@ -165,10 +165,11 @@ See [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) for the core implem
 
 The control plane (HMAC, dedupe, authorization, SQLite state, safe `shell: false`
 dispatch, worktrees + named branches + lease, base-ref movement guard, worker
-env allowlist, live-remote base tracking, envelope/PR-branch + lifecycle
-cross-check, two-scope path policy, retry-reconstructed clean worktree,
-single-lease semantics) is implemented and tested (`node test.mjs` → 37 passing).
-It is **not yet production-safe** for unattended use until these remain:
+env allowlist, live-remote base tracking, envelope/PR-branch + existing-state
+cross-check, two-scope path policy, single-live-execution guard, retry-reconstructed
+clean worktree, single-lease semantics) is implemented and tested (`node test.mjs`
+→ 41 passing). It is **not yet production-safe** for unattended use until these
+remain:
 
 - GitHub Actions as the required-check authority (M2.1 `ci.sh` contract);
 - GitHub Rulesets so required checks/review cannot be bypassed by normal agent

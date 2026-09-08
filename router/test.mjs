@@ -1,5 +1,5 @@
 // router/test.mjs — Sonoran control-plane tests. Run: node test.mjs
-import { parseEnvelope, legalTransition, validateEnvelopeContext, pathScopes, validBranchName, validateNewTaskState, canEnterInProgress } from './lib/handoff.mjs';
+import { parseEnvelope, legalTransition, validateEnvelopeContext, pathScopes, validBranchName, validateNewTaskState, validateExistingTaskState, canEnterInProgress } from './lib/handoff.mjs';
 import { authorize } from './lib/auth.mjs';
 import { normalize } from './lib/events.mjs';
 import { interpolateArgs, runWorker, buildWorkerEnv } from './lib/workers.mjs';
@@ -8,6 +8,7 @@ import { runGit, createWorktree, removeWorktree, installPushGuard, resolveGitDir
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import http from 'node:http';
+import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -175,6 +176,21 @@ test('handoff: new-task lifecycle state is restricted; existing retries obey tra
   assert(!canEnterInProgress('planned'), 'planned -> in_progress is not a direct legal transition');
 });
 
+test('handoff: existing task envelope state must agree with persisted state (fail closed)', () => {
+  assert(validateExistingTaskState({ state: 'blocked' }, { state: 'blocked' }).ok, 'blocked+blocked agrees');
+  assert(validateExistingTaskState({ state: 'review' }, { state: 'review' }).ok, 'review+review agrees');
+  assert(validateExistingTaskState({ state: 'done' }, { state: 'done' }).ok, 'done+done agrees (transition still terminal via canEnterInProgress)');
+  assert(validateExistingTaskState({ state: 'in_progress' }, { state: 'in_progress' }).ok, 'in_progress+in_progress agrees');
+  // Mismatches fail closed rather than auto-reconciling.
+  let r = validateExistingTaskState({ state: 'blocked' }, { state: 'done' });
+  assert(!r.ok && r.errors.some((e) => e.includes('does not match persisted')), 'blocked+done mismatch refused');
+  r = validateExistingTaskState({ state: 'review' }, { state: 'planned' });
+  assert(!r.ok && r.errors.some((e) => e.includes('does not match persisted')), 'review+planned mismatch refused');
+  assert(!validateExistingTaskState({ state: 'in_progress' }, { state: 'blocked' }).ok, 'in_progress+blocked mismatch refused');
+  // done remains terminal.
+  assert(!canEnterInProgress('done'), 'done stays terminal');
+});
+
 test('handoff: envelope branch must match PR head branch when the event carries one', () => {
   const prCtx = { repo: 'Sonoran-Solutions/dualdex', issueNumber: 7, branch: 'feat/real' };
   // PR branch match -> allowed.
@@ -280,6 +296,36 @@ test('state: a stale lease cannot reap a worktree owned by a newer active lease'
   const expires = state.listExpiredLeases(db, state.now());
   assert(expires.length === 1 && expires[0].id === 'stale', 'stale lease listed');
   assert(state.activeLeaseOwnsWorktree(db, { sourceRepo: '/src', worktree: '/wt' }, 'stale'), 'an active lease still owns /wt');
+  state.close(db); rmSync(dir, { recursive: true, force: true });
+});
+
+test('state: activeExecutionState distinguishes a live execution from a stale one', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-exec-'));
+  const db = state.openDb(join(dir, 's.sqlite'));
+  state.createTask(db, { id: 'dualdex-25', repo: 'r/r', issue: '25', state: 'in_progress' });
+
+  // No run + no lease -> not live.
+  let e = state.activeExecutionState(db, 'dualdex-25');
+  assert(!e.live && !e.runningRun && !e.activeLease, 'no execution -> not live');
+
+  // Running run + active UNEXPIRED lease -> live.
+  state.createRun(db, { id: 'r1', taskId: 'dualdex-25', agent: 'codex', attempt: 1 });
+  state.createLease(db, { id: 'l1', taskId: 'dualdex-25', worktree: '/wt', owner: 'codex', sourceRepo: '/src', expiresAt: new Date(Date.now() + 5000).toISOString() });
+  e = state.activeExecutionState(db, 'dualdex-25');
+  assert(e.live === true && e.runningRun.id === 'r1' && e.activeLease.id === 'l1', 'running + unexpired lease -> live');
+  assert(!state.isLeaseExpired(e.activeLease), 'unexpired lease is not expired');
+
+  // Running run + EXPIRED lease -> stale (recoverable), not live.
+  state.createLease(db, { id: 'l2', taskId: 'dualdex-25', worktree: '/wt', owner: 'hermes', sourceRepo: '/src', expiresAt: new Date(Date.now() - 5000).toISOString() });
+  state.releaseLease(db, 'l1');
+  e = state.activeExecutionState(db, 'dualdex-25');
+  assert(e.live === false && e.runningRun && e.activeLease.id === 'l2', 'running + expired lease -> stale');
+  assert(state.isLeaseExpired(e.activeLease), 'expired lease detected');
+
+  // Marking the stale run abandoned clears it from "running".
+  state.markRunAbandoned(db, 'r1', 'reconciled');
+  assert(state.getRunningRunForTask(db, 'dualdex-25') == null, 'abandoned run is no longer running');
+
   state.close(db); rmSync(dir, { recursive: true, force: true });
 });
 
@@ -468,6 +514,61 @@ test('worktrees: a task can narrow but NEVER widen the worker baseline; both sco
   assert(r.status !== 0, 'task * cannot widen the worker baseline');
   assertStderr(r, "outside the worker/repository baseline allowed paths");
   removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 's3' });
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('worktrees: omitted task scope means worker-baseline-only, never deny-all; stale task scope removed', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-optional-scope-'));
+  const { src, baseSha } = makeRemoteRepo(dir);
+  const wtRoot = join(dir, 'worktrees');
+  const assertStderr = (r, needle) => assert(String(r.stderr).includes(needle), `expected "${needle}" in ${JSON.stringify(String(r.stderr))}`);
+  const commit = (wt, rel) => { const f = join(wt, rel); mkdirSync(dirname(f), { recursive: true }); writeFileSync(f, 'x'); runGit(wt, ['add', rel]); runGit(wt, ['commit', '-qm', 'add ' + rel]); return runGit(wt, ['rev-parse', 'HEAD']).trim(); };
+  const push = (hook, wt, branch, sha) => spawnSync('sh', [hook], { cwd: wt, input: `refs/heads/${branch} ${sha} refs/heads/${branch} ${ZERO}\n` });
+
+  // A. worker=['app/src/**'], task scope OMITTED -> app/src/foo.js allowed (not deny-all).
+  let wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'o1', baseSha, branch: 'feat-omitted' });
+  installPushGuard(wt, { workerAllowedPaths: ['app/src/**'], taskAllowedPaths: [], baseSha, baseRef: 'main' });
+  assert(!existsSync(join(wt, '.sonoran-task-allowed-paths')), 'no task-scope file is written when task scope is omitted');
+  let hook = join(resolveGitDir(wt), 'hooks', 'pre-push');
+  let sha = commit(wt, 'app/src/foo.js');
+  let r = push(hook, wt, 'feat-omitted', sha);
+  assert(r.status === 0, 'A. worker-allowed change with omitted task scope is allowed');
+  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'o1' });
+
+  // B. worker=['app/src/**'], task scope OMITTED -> native/foo.cpp blocked by worker baseline.
+  wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'o2', baseSha, branch: 'feat-workerblock' });
+  installPushGuard(wt, { workerAllowedPaths: ['app/src/**'], taskAllowedPaths: [], baseSha, baseRef: 'main' });
+  hook = join(resolveGitDir(wt), 'hooks', 'pre-push');
+  sha = commit(wt, 'native/foo.cpp');
+  r = push(hook, wt, 'feat-workerblock', sha);
+  assert(r.status !== 0, 'B. file outside worker baseline blocked');
+  assertStderr(r, "outside the worker/repository baseline allowed paths");
+  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'o2' });
+
+  // C. a stale task-scope restriction from a prior install is removed on a later
+  //    no-task-scope install, so a worker-allowed change outside the old task scope
+  //    is now allowed.
+  wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'o3', baseSha, branch: 'feat-stale' });
+  installPushGuard(wt, { workerAllowedPaths: ['app/src/**'], taskAllowedPaths: ['app/src/import/**'], baseSha, baseRef: 'main' });
+  assert(existsSync(join(wt, '.sonoran-task-allowed-paths')), 'task scope present on first install');
+  installPushGuard(wt, { workerAllowedPaths: ['app/src/**'], taskAllowedPaths: [], baseSha, baseRef: 'main' });
+  assert(!existsSync(join(wt, '.sonoran-task-allowed-paths')), 'stale task-scope file removed when task scope omitted');
+  hook = join(resolveGitDir(wt), 'hooks', 'pre-push');
+  sha = commit(wt, 'app/src/other.js'); // within worker baseline, outside the old app/src/import/**
+  r = push(hook, wt, 'feat-stale', sha);
+  assert(r.status === 0, 'C. worker-allowed change allowed after stale task restriction removed');
+  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'o3' });
+
+  // D. task narrowing still applies when a task scope is present.
+  wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'o4', baseSha, branch: 'feat-stillnarrow' });
+  installPushGuard(wt, { workerAllowedPaths: ['app/src/**'], taskAllowedPaths: ['app/src/import/**'], baseSha, baseRef: 'main' });
+  hook = join(resolveGitDir(wt), 'hooks', 'pre-push');
+  sha = commit(wt, 'app/src/other.js');
+  r = push(hook, wt, 'feat-stillnarrow', sha);
+  assert(r.status !== 0, 'D. task scope still narrows when present');
+  assertStderr(r, "outside this task's allowed paths");
+  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'o4' });
 
   rmSync(dir, { recursive: true, force: true });
 });
@@ -906,6 +1007,105 @@ acceptance: |
   } finally {
     child.kill('SIGTERM');
     await new Promise((r) => child.on('close', r));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('integration: a second delivery during a LIVE execution is refused; the live worker is untouched', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-concurrent-'));
+  const port = 8243;
+  const SECRET = 'test-secret';
+  const repoSlug = 'Sonoran-Solutions/dualdex';
+  const remoteBase = join(dir, 'git-remote');
+  const bareRepo = join(remoteBase, repoSlug) + '.git';
+  mkdirSync(dirname(bareRepo), { recursive: true });
+  spawnSync('git', ['init', '--bare', '--quiet', bareRepo], { cwd: dir }).status === 0 || assert(false, 'bare init');
+  const seed = join(dir, 'seed');
+  mkdirSync(seed);
+  runGit(seed, ['init', '-q']);
+  runGit(seed, ['config', 'user.email', 't@t']);
+  runGit(seed, ['config', 'user.name', 't']);
+  runGit(seed, ['remote', 'add', 'origin', bareRepo]);
+  writeFileSync(join(seed, 'f.txt'), 'hello');
+  runGit(seed, ['add', 'f.txt']);
+  runGit(seed, ['commit', '-qm', 'init']);
+  runGit(seed, ['branch', '-M', 'main']);
+  runGit(seed, ['push', '-q', '-u', 'origin', 'main']);
+  spawnSync('git', ['symbolic-ref', 'HEAD', 'refs/heads/main'], { cwd: bareRepo }).status === 0 || assert(false, 'set bare HEAD');
+  const baseSha = runGit(seed, ['rev-parse', 'HEAD']).trim();
+
+  const cfg = {
+    port, devMode: false, bodyLimitBytes: 65536, defaultTimeoutMs: 20000, maxConcurrency: 4,
+    githubSecretEnv: 'GITHUB_WEBHOOK_SECRET', slackWebhookEnv: 'SLACK_WEBHOOK_URL',
+    stateDb: join(dir, 'state.sqlite'), reposRoot: join(dir, 'repos'), worktreeRoot: join(dir, 'worktrees'),
+    repoBase: remoteBase, defaultBaseRef: 'main', reapIntervalMs: 0, leaseDurationMs: 86400000,
+    allowlist: ['trusted-user'], requireLabel: 'agent:ready',
+    workers: {
+      // A worker that stays alive long enough for a second delivery to arrive.
+      codex: { program: 'node', args: ['-e', 'setTimeout(()=>process.exit(0), 3000)'], createsTask: true, allowedPaths: ['app/src/**'], envAllowlist: ['PATH', 'HOME'] },
+    },
+    rules: [{ id: 'codex-on-ready-label', when: { events: ['issues'], actions: ['labeled'] }, worker: 'codex', authorize: 'label' }],
+  };
+  writeFileSync(join(dir, 'config.json'), JSON.stringify(cfg));
+  const child = spawn('node', ['server.mjs'], { cwd: routerDir, env: { ...process.env, CONFIG_PATH: join(dir, 'config.json'), GITHUB_WEBHOOK_SECRET: SECRET, SLACK_WEBHOOK_URL: 'https://hooks.slack.com/x', DRY_RUN: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  child.stderr.on('data', () => {});
+  const mkEnv = (state) => `---
+schema_version: 1
+agent: hermes
+to: codex
+repo: sonoran-solutions/dualdex
+issue: "25"
+branch: feat/25
+base_sha: ${baseSha}
+state: ${state}
+task: Fix the thing
+acceptance: |
+  test passes
+---`;
+  const mkBody = (state, delivery) => JSON.stringify({
+    action: 'labeled', sender: { login: 'trusted-user' }, repository: { full_name: repoSlug },
+    label: { name: 'agent:ready' }, issue: { number: 25, title: 'Fix', body: mkEnv(state), labels: [{ name: 'agent:ready' }] },
+  });
+  try {
+    await waitFor(() => httpRequest(port, { method: 'GET', path: '/health' }).then((r) => r.status === 200), 6000);
+
+    // 1. First delivery starts a long-lived worker; issue the request WITHOUT awaiting.
+    const firstBody = mkBody('planned', 'd-live-1');
+    const firstReq = httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-live-1', 'X-Hub-Signature-256': sign(SECRET, firstBody) }, body: firstBody });
+
+    // 2. Wait until the first execution is in progress (router inFlight >= 1).
+    await waitFor(() => httpRequest(port, { method: 'GET', path: '/health' }).then((r) => r.body.inFlight >= 1), 5000);
+
+    // 3. A second delivery (different delivery id) while the worker is LIVE -> REFUSED.
+    const secondBody = mkBody('in_progress', 'd-live-2');
+    const second = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-live-2', 'X-Hub-Signature-256': sign(SECRET, secondBody) }, body: secondBody });
+    assert(second.status === 422 && second.body.refusal === true && /active execution/.test(second.body.reason), `second delivery refused: ${JSON.stringify(second.body)}`);
+
+    // 4. The first worker continues and completes normally.
+    const first = await firstReq;
+    assert(first.status === 200 && first.body.ok === true, `first worker completed normally: ${JSON.stringify(first.body)}`);
+    const firstWorktree = first.body.worktree;
+    assert(firstWorktree, 'first response has a worktree');
+
+    // 5. The live worker's worktree was NOT removed/reconstructed by the refused second.
+    assert(existsSync(firstWorktree), 'live worker worktree still exists after refused second delivery');
+
+    // 6. After the worker finishes (no live execution), a legal retry can proceed.
+    const thirdBody = mkBody('in_progress', 'd-live-3');
+    const third = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-live-3', 'X-Hub-Signature-256': sign(SECRET, thirdBody) }, body: thirdBody });
+    assert(third.status === 200 && third.body.ok === true, `legal retry after completion proceeded: ${JSON.stringify(third.body)}`);
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise((r) => child.on('close', r));
+    // DB assertions after the server is down: exactly the first + third runs exist
+    // (the refused second delivery created none), and exactly one active lease.
+    const rdb = new DatabaseSync(join(dir, 'state.sqlite'), { readOnly: true });
+    const runs = rdb.prepare('SELECT * FROM runs WHERE task_id = ?').all('dualdex-25');
+    const activeLeases = rdb.prepare("SELECT * FROM leases WHERE task_id = ? AND status = 'active'").all('dualdex-25');
+    rdb.close();
+    assert(runs.length === 2, `exactly 2 runs (first + retry); the refused second created none (got ${runs.length})`);
+    assert(runs.some((r) => r.status === 'success'), 'completed run recorded as success');
+    assert(activeLeases.length === 1, `exactly one active lease (got ${activeLeases.length})`);
     rmSync(dir, { recursive: true, force: true });
   }
 });

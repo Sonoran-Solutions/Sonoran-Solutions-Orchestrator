@@ -39,11 +39,13 @@ router/
 | Per-task git worktree + **named task branch** + lease + allowed-path / base-ref movement pre-push guard | ✅ (create/reap/guard, fail-closed) |
 | Live-remote base tracking: refresh + verify base SHA against `refs/remotes/origin/<baseRef>`, stale base refused | ✅ |
 | Envelope/context cross-check (repo/issue/branch/allowed_paths/base_sha, PR-head branch) | ✅ |
-| Path policy: worker baseline AND task scope enforced per file (task cannot widen worker baseline) | ✅ |
+| Path policy: worker baseline REQUIRED AND (optional) task scope enforced per file; task cannot widen worker baseline; omitted task scope = worker-baseline-only | ✅ |
 | Retry lifecycle: clean worktree reconstructed from authoritative Git state, incompatible branch fails closed | ✅ |
+| Single live execution per task: a 2nd delivery while a run is 'running' + an active, unexpired lease is refused | ✅ |
+| Existing-task envelope state must equal persisted task state (fail closed on mismatch); done stays terminal | ✅ |
 | Exactly one active lease per task; stale lease never reaps an owned worktree | ✅ |
 | Worker env hygiene: allowlist-only environment (no router-secret leakage) | ✅ |
-| Tests: 37 passing (`node test.mjs`) | ✅ |
+| Tests: 41 passing (`node test.mjs`) | ✅ |
 
 A random public issue/PR **cannot** launch a worker: it needs a valid signature,
 an untrusted actor is rejected, a code-editing dispatch additionally needs a
@@ -123,21 +125,23 @@ falling back to the PR base ref when the event carries one.
 Path scope is two independent scopes, both enforced per changed file by the
 cooperative pre-push guard:
 
-- **worker/repository baseline** = the worker's `allowedPaths` (the MAXIMUM trusted
-  boundary). `.sonoran-worker-allowed-paths`.
+- **worker/repository baseline** = the worker's `allowedPaths` (the REQUIRED MAXIMUM
+  trusted boundary). Always written to `.sonoran-worker-allowed-paths`.
 - **task scope** = the envelope's `allowed_paths` (an OPTIONAL additional narrowing
-  boundary). `.sonoran-task-allowed-paths`.
+  boundary). Written to `.sonoran-task-allowed-paths` **only when non-empty**;
+  omitted task scope means worker-baseline-only, NOT deny-all.
 
 A file must match BOTH when a task scope exists. A task `allowed_paths` of `*` can
 **never** widen the worker baseline. If a code worker has an empty baseline, the
-dispatch fails closed.
+dispatch fails closed. A stale task-scope file from a previous run is removed when
+a later run supplies no task scope, so an old restriction cannot leak forward.
 
 > Note: this Git hook is a **cooperative** enforcement layer (a worker can tamper
 > with its own hook/worktree). It is not router-owned push verification, so it is
 > not an unbypassable security boundary. ORCH-080 (router-owned lease verification
 > before push) remains open.
 
-### Worktree retry lifecycle
+### Worktree retry + single-live-execution lifecycle
 
 Each new execution attempt reconstructs a clean named worktree from authoritative
 Git state (`prepareWorktreeForRun`): it removes any prior worktree for the task,
@@ -147,6 +151,18 @@ than auto-rebasing/merging) or recreates it from the verified base SHA. A retry
 never inherits dirt, local-only commits, an old base, or the wrong branch. The
 worktree must be on the expected named branch, non-detached, clean, and at the
 expected starting commit before a worker is launched.
+
+At most **one live execution** may exist per task. The router's live-execution
+ownership signal is: a run still marked `running` AND an active, unexpired lease.
+A delivery that finds such a state is refused with `task already has an active
+execution` and does NOT release the lease, delete the worktree, or launch a second
+worker. If a `running` run exists but the lease is expired (or there is no active
+lease), the previous execution is treated as stale: the old `running` run is
+reconciled to `abandoned` and the stale lease is released before a controlled
+recovery is allowed. An omitted/done task stays terminal (no reopen).
+
+For an existing task, the handoff envelope's `state` must equal the persisted task
+state; a mismatch is refused (fail closed) rather than auto-reconciled.
 
 ### Rules
 
@@ -182,10 +198,12 @@ node test.mjs
 ```
 
 Covers handoff parsing/validation, authorization, event normalization, SQLite
-state (dedupe/idempotent re-delivery/single active lease/stale-lease ownership),
-worktrees (named branch, safe branch names, live-remote base tracking, fetch
-failure fail-closed, retry-clean lifecycle, incompatible-branch fail-closed),
+state (dedupe/idempotent re-delivery/single active lease/stale-lease ownership/
+live-execution detection), worktrees (named branch, safe branch names, live-remote
+base tracking, fetch-failure fail-closed, retry-clean lifecycle, incompatible-branch
+fail-closed, omitted-task-scope = worker-baseline-only, stale task-scope removal),
 two-scope push-guard enforcement, shell-injection safety, worker env allowlist
 filtering, and offline HTTP integration tests (HMAC/auth/dedupe/422 gates, a full
-issues:labeled code task that honors lifecycle + path policy, and a PR-context
-branch-mismatch refusal).
+issues:labeled code task that honors lifecycle + path policy, a PR-context
+branch-mismatch refusal, and a concurrent test proving a live worker is never
+clobbered by a second delivery).

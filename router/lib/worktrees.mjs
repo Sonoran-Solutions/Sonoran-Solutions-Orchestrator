@@ -1,6 +1,6 @@
 // lib/worktrees.mjs — per-task git worktree + lease isolation. ORCH-077..083.
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 export function runGit(cwd, args) {
@@ -15,10 +15,6 @@ export function ensureRepo(repoSlug, reposRoot, base = 'https://github.com') {
   mkdirSync(reposRoot, { recursive: true });
   runGit(reposRoot, ['clone', '--quiet', `${base}/${repoSlug}.git`, dir]);
   return dir;
-}
-
-export function fetchLatest(sourceRepo, branch = '--all') {
-  runGit(sourceRepo, ['fetch', '--quiet', 'origin', ...(branch === '--all' ? ['--all'] : [branch])]);
 }
 
 // Resolve a plain commit-ish (full or short SHA, or a ref) to a full 40-hex commit
@@ -291,14 +287,24 @@ exit 0
 `;
 
 // Install a pre-push guard into the worktree's actual git dir (best-effort).
-// workerAllowedPaths is the worker/repository baseline (maximum trusted boundary);
-// taskAllowedPaths is an optional narrowing boundary. Both are written so the guard
-// enforces the intersection per changed file.
+// workerAllowedPaths is the worker/repository baseline (REQUIRED maximum trusted
+// boundary) and is ALWAYS written. taskAllowedPaths is an OPTIONAL additional
+// narrowing boundary: it is written ONLY when non-empty, and any stale task-scope
+// file from a previous run is REMOVED when this run supplies no task scope, so an
+// old restriction can never leak into a new worker-scope-only run. Task scope can
+// never widen the worker baseline because both are enforced per changed file.
 export function installPushGuard(worktreePath, { workerAllowedPaths = [], taskAllowedPaths = [], baseSha = '', baseRef = '' } = {}) {
   const gitdir = resolveGitDir(worktreePath);
   if (!gitdir) return;
   writeFileSync(join(worktreePath, '.sonoran-worker-allowed-paths'), (workerAllowedPaths || []).join('\n') + '\n');
-  writeFileSync(join(worktreePath, '.sonoran-task-allowed-paths'), (taskAllowedPaths || []).join('\n') + '\n');
+  const taskFile = join(worktreePath, '.sonoran-task-allowed-paths');
+  if (Array.isArray(taskAllowedPaths) && taskAllowedPaths.length) {
+    writeFileSync(taskFile, taskAllowedPaths.join('\n') + '\n');
+  } else {
+    // No task narrowing supplied: remove any stale task-scope restriction so the
+    // guard falls back to worker-baseline-only (not an accidental deny-all).
+    try { rmSync(taskFile, { force: true }); } catch { /* already absent */ }
+  }
   if (baseSha) {
     writeFileSync(join(worktreePath, '.sonoran-base-sha'), baseSha + '\n');
   }
