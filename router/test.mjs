@@ -1,14 +1,14 @@
 // router/test.mjs — Sonoran control-plane tests. Run: node test.mjs
-import { parseEnvelope, legalTransition, validateEnvelopeContext, effectiveAllowedPaths, validBranchName } from './lib/handoff.mjs';
+import { parseEnvelope, legalTransition, validateEnvelopeContext, pathScopes, validBranchName, validateNewTaskState, canEnterInProgress } from './lib/handoff.mjs';
 import { authorize } from './lib/auth.mjs';
 import { normalize } from './lib/events.mjs';
 import { interpolateArgs, runWorker, buildWorkerEnv } from './lib/workers.mjs';
 import * as state from './lib/state.mjs';
-import { runGit, createWorktree, removeWorktree, installPushGuard, resolveGitDir, removeWorktreePath, safeBranchName, resolveBaseSha } from './lib/worktrees.mjs';
+import { runGit, createWorktree, removeWorktree, installPushGuard, resolveGitDir, removeWorktreePath, safeBranchName, resolveBaseSha, resolveCommitSha, prepareWorktreeForRun, verifyCleanWorktree } from './lib/worktrees.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import http from 'node:http';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -42,6 +42,20 @@ function makeRemoteRepo(dir) {
   return { remoteDir, src, baseSha };
 }
 const ZERO = '0000000000000000000000000000000000000000';
+
+// Advance the remote's main branch from a separate clone, WITHOUT touching `src`.
+// Returns the new base SHA.
+function advanceRemoteMain(remoteDir, dir) {
+  const peer = join(dir, 'peer-' + Date.now());
+  spawnSync('git', ['clone', '-q', '-b', 'main', remoteDir, peer], { cwd: dir }).status === 0 || assert(false, 'peer clone');
+  git(peer, ['config', 'user.email', 't@t']);
+  git(peer, ['config', 'user.name', 't']);
+  writeFileSync(join(peer, 'g-' + Date.now() + '.txt'), 'x');
+  git(peer, ['add', '.']);
+  git(peer, ['commit', '-qm', 'advance base']);
+  git(peer, ['push', '-q', 'origin', 'main']);
+  return git(peer, ['rev-parse', 'HEAD']).trim();
+}
 
 // ---------------------------------------------------------------- handoff
 const ENVELOPE = `---\nschema_version: 1\nagent: codex\nto: antigravity\nrepo: Sonoran-Solutions/dualdex\nissue: "123"\nbranch: feat/123\nstate: planned\ntask: Add profile\nsummary: |\n  Do the thing\n  with more detail\nacceptance: |\n  test passes\nurgency: normal\nescalate_to: human\n---\nrest is prose`;
@@ -126,17 +140,53 @@ test('handoff: envelope is cross-checked against event context (repo/issue/branc
   assert(!r.ok && r.errors.some((e) => e.includes('allowed_paths')), 'non-string allowed_path rejected');
 });
 
-test('handoff: effective allowed paths use the task scope, not the worker-global scope', () => {
+test('handoff: path scopes keep worker baseline AND task scope independent (no widening)', () => {
   const workerScope = ['app/src/**', 'native/**'];
-  // No task scope -> worker-global baseline.
-  assert(JSON.stringify(effectiveAllowedPaths({}, workerScope)) === JSON.stringify(workerScope), 'falls back to worker scope');
-  // Task scope present -> task scope binds (narrower), overrides the worker-global baseline.
-  const taskScope = ['tests/**'];
-  assert(JSON.stringify(effectiveAllowedPaths({ allowed_paths: taskScope }, workerScope)) === JSON.stringify(taskScope), 'task scope overrides worker scope');
-  // Empty/null task scope -> worker-global.
-  assert(JSON.stringify(effectiveAllowedPaths({ allowed_paths: [] }, workerScope)) === JSON.stringify(workerScope), 'empty task scope falls back');
+  // No task scope -> worker baseline alone.
+  let s = pathScopes({}, workerScope);
+  assert(JSON.stringify(s.worker) === JSON.stringify(workerScope) && JSON.stringify(s.task) === '[]', 'no task scope falls back to worker baseline');
+  // Task scope present -> BOTH are returned independently (worker baseline is max; task narrows).
+  s = pathScopes({ allowed_paths: ['tests/**'] }, workerScope);
+  assert(JSON.stringify(s.worker) === JSON.stringify(workerScope), 'worker baseline preserved');
+  assert(JSON.stringify(s.task) === JSON.stringify(['tests/**']), 'task scope returned separately');
+  // A task '*' does NOT replace/override the worker baseline (widening is impossible).
+  s = pathScopes({ allowed_paths: ['*'] }, workerScope);
+  assert(JSON.stringify(s.worker) === JSON.stringify(workerScope), 'worker baseline still preserved when task says *');
+  // Empty/null task scope -> no narrowing boundary.
+  s = pathScopes({ allowed_paths: [] }, workerScope);
+  assert(JSON.stringify(s.task) === '[]', 'empty task scope is no narrowing');
   assert(validBranchName('agent/task-1'), 'validBranchName accepts safe names');
   assert(!validBranchName('x;cat /etc/passwd'), 'validBranchName rejects shell metachars');
+});
+
+test('handoff: new-task lifecycle state is restricted; existing retries obey transitions', () => {
+  // New task: only planned/authorized/assigned are acceptable starting states.
+  assert(validateNewTaskState('planned').ok, 'planned accepted');
+  assert(validateNewTaskState('authorized').ok, 'authorized accepted (trusted agent:ready signal)');
+  assert(validateNewTaskState('assigned').ok, 'assigned accepted');
+  for (const bad of ['in_progress', 'done', 'review', 'verification', 'blocked', 'escalated']) {
+    assert(!validateNewTaskState(bad).ok, `${bad} rejected for a new task`);
+  }
+  // Existing task retries: in_progress re-run allowed, legal transitions allowed, done terminal.
+  assert(canEnterInProgress('in_progress'), 'in_progress re-run allowed');
+  assert(canEnterInProgress('blocked'), 'blocked -> in_progress allowed');
+  assert(canEnterInProgress('review'), 'review -> in_progress allowed (fix loop)');
+  assert(!canEnterInProgress('done'), 'done -> in_progress rejected (terminal)');
+  assert(!canEnterInProgress('planned'), 'planned -> in_progress is not a direct legal transition');
+});
+
+test('handoff: envelope branch must match PR head branch when the event carries one', () => {
+  const prCtx = { repo: 'Sonoran-Solutions/dualdex', issueNumber: 7, branch: 'feat/real' };
+  // PR branch match -> allowed.
+  let r = validateEnvelopeContext({ repo: 'Sonoran-Solutions/dualdex', issue: '7', branch: 'feat/real' }, prCtx);
+  assert(r.ok, 'PR branch match allowed');
+  // PR branch mismatch -> refusal.
+  r = validateEnvelopeContext({ repo: 'Sonoran-Solutions/dualdex', issue: '7', branch: 'feat/something-else' }, prCtx);
+  assert(!r.ok && r.errors.some((e) => e.includes('does not match event branch')), 'PR branch mismatch refused');
+  // Issue event (no event branch) -> branch syntax-only.
+  const issueCtx = { repo: 'Sonoran-Solutions/dualdex', issueNumber: 25, branch: '' };
+  r = validateEnvelopeContext({ repo: 'Sonoran-Solutions/dualdex', issue: '25', branch: 'feat/25' }, issueCtx);
+  assert(r.ok, 'issue event with valid task branch allowed');
 });
 
 // ---------------------------------------------------------------- auth
@@ -261,18 +311,63 @@ test('worktrees: safeBranchName rejects injection / invalid branch names', () =>
   assert(safeBranchName('/abs') === '', 'leading slash rejected');
 });
 
-test('worktrees: resolveBaseSha verifies a nonempty base SHA or returns null', () => {
+test('worktrees: resolveBaseSha tracks the live remote base tip, not a stale local ref (ORCH-081)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'sonoran-base-'));
   const { remoteDir, src, baseSha } = makeRemoteRepo(dir);
   assert(/^[0-9a-f]{40}$/.test(baseSha), 'base canary SHA is full length');
-  // Resolve from a ref tip (issue task with no provided SHA).
-  assert(resolveBaseSha(src, 'main') === baseSha, 'resolves ref tip to the seeded base SHA');
-  // Resolve a provided SHA (PR task); short SHAs expand to full.
-  assert(resolveBaseSha(src, 'main', { providedSha: baseSha }) === baseSha, 'resolves provided full SHA');
-  assert(resolveBaseSha(src, 'main', { providedSha: baseSha.slice(0, 7) }) === baseSha, 'resolves provided short SHA');
-  // Unresolvable -> null (refuse to launch).
-  assert(resolveBaseSha(src, 'no-such-branch') === null, 'unknown ref -> null');
-  assert(resolveBaseSha(src, 'main', { providedSha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }) === null, 'nonexistent provided SHA -> null');
+
+  // A. Fresh remote: main = ABC -> resolves live tip.
+  let r = resolveBaseSha(src, 'main');
+  assert(r.ok && r.sha === baseSha, `A. fresh remote resolves live tip (got ${JSON.stringify(r)})`);
+
+  // C. Provided SHA equals the current remote tip -> allowed.
+  r = resolveBaseSha(src, 'main', { providedSha: baseSha });
+  assert(r.ok && r.sha === baseSha, 'C. provided SHA == live tip allowed');
+  // Short provided SHA expands to full.
+  r = resolveBaseSha(src, 'main', { providedSha: baseSha.slice(0, 7) });
+  assert(r.ok && r.sha === baseSha, 'C. short provided SHA allowed');
+
+  // B. STALE-CLONE: remote main advances to DEF but we do NOT touch the router clone.
+  const newBase = advanceRemoteMain(remoteDir, dir);
+  assert(newBase !== baseSha, 'remote main advanced');
+  assert(runGit(src, ['rev-parse', 'refs/heads/main']).trim() === baseSha, 'local main still ABC (stale clone)');
+  r = resolveBaseSha(src, 'main'); // MUST fetch and return the live DEF tip
+  assert(r.ok && r.sha === newBase, `B. stale clone refreshes to live tip DEF (got ${JSON.stringify(r)})`);
+
+  // D. Provided SHA exists but remote main has advanced -> stale refusal.
+  r = resolveBaseSha(src, 'main', { providedSha: baseSha });
+  assert(!r.ok && /stale/.test(r.reason), `D. provided SHA now stale (got ${JSON.stringify(r)})`);
+
+  // E. Nonexistent SHA -> refusal.
+  r = resolveBaseSha(src, 'main', { providedSha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' });
+  assert(!r.ok, 'E. nonexistent provided SHA refused');
+
+  // F. Nonexistent base ref -> refusal.
+  r = resolveBaseSha(src, 'no-such-branch');
+  assert(!r.ok, 'F. nonexistent base ref refused');
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('worktrees: resolveBaseSha fails closed when the remote cannot be refreshed', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-baseref-'));
+  const src = join(dir, 'repo'); mkdirSync(src);
+  runGit(src, ['init', '-q']);
+  runGit(src, ['config', 'user.email', 't@t']); runGit(src, ['config', 'user.name', 't']);
+  writeFileSync(join(src, 'f.txt'), 'x'); runGit(src, ['add', 'f.txt']); runGit(src, ['commit', '-qm', 'i']);
+  // Point origin at a nonexistent path so the fetch must fail.
+  runGit(src, ['remote', 'add', 'origin', join(dir, 'does-not-exist.git')]);
+  const r = resolveBaseSha(src, 'main');
+  assert(!r.ok && /refresh remote/.test(r.reason), `fetch failure must fail closed (got ${JSON.stringify(r)})`);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('worktrees: resolveCommitSha expands a short SHA without network', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-commit-'));
+  const { src, baseSha } = makeRemoteRepo(dir);
+  assert(resolveCommitSha(src, baseSha) === baseSha, 'full SHA resolves');
+  assert(resolveCommitSha(src, baseSha.slice(0, 7)) === baseSha, 'short SHA expands to full');
+  assert(resolveCommitSha(src, 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef') === null, 'nonexistent SHA -> null');
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -296,7 +391,7 @@ test('worktrees: push guard blocks base-branch movement + direct base push + sco
   const { remoteDir, src, baseSha } = makeRemoteRepo(dir);
   const wtRoot = join(dir, 'worktrees');
   const wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha, branch: 'feat/1' });
-  installPushGuard(wt, { allowedPaths: ['*'], baseSha, baseRef: 'main' });
+  installPushGuard(wt, { workerAllowedPaths: ['*'], taskAllowedPaths: [], baseSha, baseRef: 'main' });
   assert(readFileSync(join(wt, '.sonoran-base-sha'), 'utf8').trim() === baseSha, 'base-sha file written');
   assert(readFileSync(join(wt, '.sonoran-base-ref'), 'utf8').trim() === 'main', 'base-ref file written');
 
@@ -313,32 +408,160 @@ test('worktrees: push guard blocks base-branch movement + direct base push + sco
   assert(r.status !== 0, 'direct push to base branch blocked');
   assertStderr(r, 'cannot push directly to the base branch');
 
-  // 3. Allow-paths gate: an out-of-scope file is blocked (while the base is unchanged)
+  // 3. A file outside the worker baseline is blocked
   writeFileSync(join(wt, 'outside.txt'), 'x');
   runGit(wt, ['add', 'outside.txt']);
   runGit(wt, ['commit', '-qm', 'outside change']);
   const localSha2 = runGit(wt, ['rev-parse', 'HEAD']).trim();
-  installPushGuard(wt, { allowedPaths: ['app/src/**'], baseSha, baseRef: 'main' });
+  installPushGuard(wt, { workerAllowedPaths: ['app/src/**'], taskAllowedPaths: [], baseSha, baseRef: 'main' });
   r = spawnSync('sh', [hook], { cwd: wt, input: `refs/heads/feat/1 ${localSha2} refs/heads/feat/1 ${ZERO}\n` });
-  assert(r.status !== 0, 'out-of-scope file blocked');
-  assertStderr(r, "outside this task's allowed paths");
+  assert(r.status !== 0, 'out-of-worker-baseline file blocked');
+  assertStderr(r, "outside the worker/repository baseline allowed paths");
 
   // 4. Move main on the remote (simulating the base moving unexpectedly)
-  const peer = join(dir, 'peer');
-  spawnSync('git', ['clone', '-q', '-b', 'main', remoteDir, peer], { cwd: dir }).status === 0 || assert(false, 'peer clone');
-  git(peer, ['config', 'user.email', 't@t']);
-  git(peer, ['config', 'user.name', 't']);
-  writeFileSync(join(peer, 'g.txt'), 'x');
-  git(peer, ['add', 'g.txt']);
-  git(peer, ['commit', '-qm', 'move base']);
-  git(peer, ['push', '-q', 'origin', 'main']);
-  const newBase = git(src, ['ls-remote', 'origin', 'refs/heads/main']).split('\t')[0].trim();
+  const newBase = advanceRemoteMain(remoteDir, dir);
   assert(newBase !== baseSha, 'remote main advanced past recorded base');
 
   // 5. Now a NEW feature branch push is blocked because the base moved
   r = spawnSync('sh', [hook], { cwd: wt, input: `refs/heads/feat/2 ${localSha2} refs/heads/feat/2 ${ZERO}\n` });
   assert(r.status !== 0, 'new branch blocked after base moved');
   assertStderr(r, 'base branch moved unexpectedly');
+
+  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1' });
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('worktrees: a task can narrow but NEVER widen the worker baseline; both scopes enforced', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-scope-'));
+  const { src, baseSha } = makeRemoteRepo(dir);
+  const wtRoot = join(dir, 'worktrees');
+  const assertStderr = (r, needle) => assert(String(r.stderr).includes(needle), `expected "${needle}" in ${JSON.stringify(String(r.stderr))}`);
+
+  const commit = (wt, rel) => { const f = join(wt, rel); mkdirSync(dirname(f), { recursive: true }); writeFileSync(f, 'x'); runGit(wt, ['add', rel]); runGit(wt, ['commit', '-qm', 'add ' + rel]); return runGit(wt, ['rev-parse', 'HEAD']).trim(); };
+  const push = (hook, wt, branch, sha) => spawnSync('sh', [hook], { cwd: wt, input: `refs/heads/${branch} ${sha} refs/heads/${branch} ${ZERO}\n` });
+
+  // Scenario 1: file matching worker AND task scope -> allowed
+  let wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 's1', baseSha, branch: 'feat-narrow' });
+  installPushGuard(wt, { workerAllowedPaths: ['app/src/**'], taskAllowedPaths: ['app/src/import/**'], baseSha, baseRef: 'main' });
+  let hook = join(resolveGitDir(wt), 'hooks', 'pre-push');
+  let sha = commit(wt, 'app/src/import/save.js');
+  let r = push(hook, wt, 'feat-narrow', sha);
+  assert(r.status === 0, 'file matching worker AND task scope allowed');
+  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 's1' });
+
+  // Scenario 2: file matches worker baseline but NOT task scope -> blocked
+  wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 's2', baseSha, branch: 'feat-taskblock' });
+  installPushGuard(wt, { workerAllowedPaths: ['app/src/**'], taskAllowedPaths: ['app/src/import/**'], baseSha, baseRef: 'main' });
+  hook = join(resolveGitDir(wt), 'hooks', 'pre-push');
+  sha = commit(wt, 'app/src/other.js');
+  r = push(hook, wt, 'feat-taskblock', sha);
+  assert(r.status !== 0, 'file outside task scope blocked');
+  assertStderr(r, "outside this task's allowed paths");
+  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 's2' });
+
+  // Scenario 3: task '*' must NOT widen the worker baseline -> blocked
+  wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 's3', baseSha, branch: 'feat-widen' });
+  installPushGuard(wt, { workerAllowedPaths: ['app/src/**'], taskAllowedPaths: ['*'], baseSha, baseRef: 'main' });
+  hook = join(resolveGitDir(wt), 'hooks', 'pre-push');
+  sha = commit(wt, 'router/server.mjs');
+  r = push(hook, wt, 'feat-widen', sha);
+  assert(r.status !== 0, 'task * cannot widen the worker baseline');
+  assertStderr(r, "outside the worker/repository baseline allowed paths");
+  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 's3' });
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------- retry lifecycle (ORCH-140)
+test('worktrees: retry never inherits a dirty prior worktree (fresh clean state)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-retry-dirty-'));
+  const { src, baseSha } = makeRemoteRepo(dir);
+  const wtRoot = join(dir, 'worktrees');
+
+  // Attempt 1: clean named worktree at the base.
+  const p1 = prepareWorktreeForRun({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha, branch: 'feat/25' });
+  assert(p1.branch === 'feat/25' && p1.startSha === baseSha, 'attempt 1 named branch at base');
+  verifyCleanWorktree(p1.path, 'feat/25', baseSha); // clean, named, non-detached
+
+  // Simulate a failed attempt: dirty a tracked file (no commit).
+  writeFileSync(join(p1.path, 'f.txt'), 'DIRTY-ATTEMPT-1');
+
+  // Retry: must not see the dirty modification.
+  const p2 = prepareWorktreeForRun({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha, branch: 'feat/25' });
+  assert(existsSync(p2.path) && p2.path === join(wtRoot, 't1'), 'recreated worktree path exists');
+  assert(readFileSync(join(p2.path, 'f.txt'), 'utf8') === 'hello', 'retry sees committed content, not the dirty modification');
+
+  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1' });
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('worktrees: retry discards a local-only commit from a prior run (no auto promotion)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-retry-local-'));
+  const { src, baseSha } = makeRemoteRepo(dir);
+  const wtRoot = join(dir, 'worktrees');
+
+  // Attempt 1: create a local-only commit in the worktree but do NOT push.
+  let p = prepareWorktreeForRun({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha, branch: 'feat/25' });
+  writeFileSync(join(p.path, 'local-only.txt'), 'x');
+  runGit(p.path, ['add', 'local-only.txt']);
+  runGit(p.path, ['commit', '-qm', 'local-only commit']);
+  const localCommit = runGit(p.path, ['rev-parse', 'HEAD']).trim();
+  assert(localCommit !== baseSha, 'local-only commit advanced the branch');
+
+  // Retry: the local-only commit must NOT become authoritative.
+  p = prepareWorktreeForRun({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha, branch: 'feat/25' });
+  assert(runGit(p.path, ['rev-parse', 'HEAD']).trim() === baseSha, 'retry branch reset to the verified base, not the local-only commit');
+  assert(!existsSync(join(p.path, 'local-only.txt')), 'local-only file is gone from the recreated worktree');
+
+  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1' });
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('worktrees: retry uses the advanced verified base, never a stale worktree', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-retry-base-'));
+  const { remoteDir, src, baseSha } = makeRemoteRepo(dir);
+  const wtRoot = join(dir, 'worktrees');
+
+  // Attempt 1 at base ABC.
+  let p = prepareWorktreeForRun({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha, branch: 'feat/25' });
+  assert(runGit(p.path, ['rev-parse', 'HEAD']).trim() === baseSha, 'attempt 1 at ABC');
+
+  // Remote main advances to DEF; the router now resolves base = DEF.
+  const newBase = advanceRemoteMain(remoteDir, dir);
+  const r = resolveBaseSha(src, 'main');
+  assert(r.ok && r.sha === newBase, 'resolved base is DEF');
+
+  // Retry with base = DEF must recreate the worktree at DEF, not reuse stale ABC state.
+  p = prepareWorktreeForRun({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha: newBase, branch: 'feat/25' });
+  assert(runGit(p.path, ['rev-parse', 'HEAD']).trim() === newBase, 'retry worktree HEAD is the new verified base DEF, not stale ABC');
+
+  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1' });
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('worktrees: incompatible remote task branch fails closed (no auto rebase)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-retry-remote-'));
+  const { remoteDir, src, baseSha } = makeRemoteRepo(dir);
+  const wtRoot = join(dir, 'worktrees');
+
+  // Attempt 1 pushes the task branch to origin based on ABC.
+  const p = prepareWorktreeForRun({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha, branch: 'feat/25' });
+  runGit(p.path, ['commit', '--allow-empty', '-qm', 'candidate']);
+  runGit(p.path, ['push', '-q', '-u', 'origin', 'feat/25']);
+
+  // Remote main advances to DEF; the task branch is based on ABC and is now stale.
+  const newBase = advanceRemoteMain(remoteDir, dir);
+  assert(newBase !== baseSha, 'remote main advanced');
+
+  // Retry cannot safely reconcile: it must FAIL CLOSED rather than auto-rebase/merge.
+  let threw = false;
+  try {
+    prepareWorktreeForRun({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha: newBase, branch: 'feat/25' });
+  } catch (e) {
+    threw = true;
+    assert(/not compatible with the current base/.test(String(e.message)), `fail-closed message (got ${e.message})`);
+  }
+  assert(threw, 'incompatible remote task branch refuses safe recreation');
 
   removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1' });
   rmSync(dir, { recursive: true, force: true });
@@ -490,7 +713,7 @@ test('integration: full control-plane flow', async () => {
   }
 });
 
-test('integration: valid issues:labeled code task resolves base SHA + creates named worktree (offline)', async () => {
+test('integration: valid issues:labeled code task honors lifecycle + resolves live base + creates clean named worktree (offline)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'sonoran-int-code-'));
   const port = 8241;
   const SECRET = 'test-secret';
@@ -522,7 +745,7 @@ test('integration: valid issues:labeled code task resolves base SHA + creates na
     repoBase: remoteBase, defaultBaseRef: 'main', reapIntervalMs: 0, leaseDurationMs: 86400000,
     allowlist: ['trusted-user'], requireLabel: 'agent:ready',
     workers: {
-      codex: { program: 'node', args: ['-e', 'console.log("codex-ran")'], createsTask: true, allowedPaths: ['**'], envAllowlist: ['PATH', 'HOME'] },
+      codex: { program: 'node', args: ['-e', 'console.log("codex-ran")'], createsTask: true, allowedPaths: ['app/src/**', 'native/**'], envAllowlist: ['PATH', 'HOME'] },
     },
     rules: [
       { id: 'codex-on-ready-label', when: { events: ['issues'], actions: ['labeled'] }, worker: 'codex', authorize: 'label' },
@@ -538,6 +761,7 @@ test('integration: valid issues:labeled code task resolves base SHA + creates na
   try {
     await waitFor(() => httpRequest(port, { method: 'GET', path: '/health' }).then((r) => r.status === 200), 6000);
 
+    // Correct lifecycle for a brand-new task: planned (preferred initial state).
     const envelope = `---
 schema_version: 1
 agent: hermes
@@ -546,7 +770,9 @@ repo: sonoran-solutions/dualdex
 issue: "25"
 branch: feat/25
 base_sha: ${baseSha}
-state: in_progress
+state: planned
+allowed_paths:
+  - app/src/import/**
 task: Fix the thing
 acceptance: |
   test passes
@@ -565,13 +791,118 @@ acceptance: |
     assert(res.body.worktree, 'worktree path returned');
 
     const wt = res.body.worktree;
-    // Named task branch, NOT detached.
+    // Correct lifecycle accepted; clean named worktree at the verified base.
     const br = runGit(wt, ['rev-parse', '--abbrev-ref', 'HEAD']).trim();
     assert(br === 'feat/25', `named task branch created (got ${br})`);
-    // Worktree sits on the verified base SHA and the push guard records it.
     assert(runGit(wt, ['rev-parse', 'HEAD']).trim() === baseSha, 'worktree HEAD is the verified base SHA');
+    // The router writes .sonoran-* metadata into the worktree; those are expected.
+    const status = runGit(wt, ['status', '--porcelain']).split('\n').filter((l) => l && !/\.sonoran-/.test(l)).join('\n');
+    assert(status === '', 'worktree is clean at launch (ignoring router metadata files)');
     assert(readFileSync(join(wt, '.sonoran-base-sha'), 'utf8').trim() === baseSha, 'push guard records the verified base SHA');
     assert(readFileSync(join(wt, '.sonoran-base-ref'), 'utf8').trim() === 'main', 'push guard records the base ref');
+    // Path policy: worker baseline AND task scope are both installed independently.
+    assert(readFileSync(join(wt, '.sonoran-worker-allowed-paths'), 'utf8').trim() === 'app/src/**\nnative/**', 'worker baseline written');
+    assert(readFileSync(join(wt, '.sonoran-task-allowed-paths'), 'utf8').trim() === 'app/src/import/**', 'task scope written');
+
+    // Negative: a brand-new task (issue 26) declaring an illegal initial state is refused.
+    const badEnvelope = `---
+schema_version: 1
+agent: hermes
+to: codex
+repo: sonoran-solutions/dualdex
+issue: "26"
+branch: feat/26
+state: in_progress
+task: Bad lifecycle
+acceptance: |
+  nope
+---`;
+    const badBody = JSON.stringify({
+      action: 'labeled',
+      sender: { login: 'trusted-user' },
+      repository: { full_name: repoSlug },
+      label: { name: 'agent:ready' },
+      issue: { number: 26, title: 'Bad', body: badEnvelope, labels: [{ name: 'agent:ready' }] },
+    });
+    const bad = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-code-2', 'X-Hub-Signature-256': sign(SECRET, badBody) }, body: badBody });
+    assert(bad.status === 422 && bad.body.reason === 'invalid initial task state', `new-task lifecycle gate: ${JSON.stringify(bad.body)}`);
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise((r) => child.on('close', r));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('integration: PR context refuses an envelope whose branch does not match the PR head (offline)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-int-pr-'));
+  const port = 8242;
+  const SECRET = 'test-secret';
+  const repoSlug = 'Sonoran-Solutions/dualdex';
+  const remoteBase = join(dir, 'git-remote');
+  const bareRepo = join(remoteBase, repoSlug) + '.git';
+  mkdirSync(dirname(bareRepo), { recursive: true });
+  spawnSync('git', ['init', '--bare', '--quiet', bareRepo], { cwd: dir }).status === 0 || assert(false, 'bare repo init');
+  const seed = join(dir, 'seed');
+  mkdirSync(seed);
+  runGit(seed, ['init', '-q']);
+  runGit(seed, ['config', 'user.email', 't@t']);
+  runGit(seed, ['config', 'user.name', 't']);
+  runGit(seed, ['remote', 'add', 'origin', bareRepo]);
+  writeFileSync(join(seed, 'f.txt'), 'hello');
+  runGit(seed, ['add', 'f.txt']);
+  runGit(seed, ['commit', '-qm', 'init']);
+  runGit(seed, ['branch', '-M', 'main']);
+  runGit(seed, ['push', '-q', '-u', 'origin', 'main']);
+  spawnSync('git', ['symbolic-ref', 'HEAD', 'refs/heads/main'], { cwd: bareRepo }).status === 0 || assert(false, 'set bare HEAD');
+  const baseSha = runGit(seed, ['rev-parse', 'HEAD']).trim();
+
+  const cfg = {
+    port, devMode: false, bodyLimitBytes: 65536, defaultTimeoutMs: 20000, maxConcurrency: 2,
+    githubSecretEnv: 'GITHUB_WEBHOOK_SECRET', slackWebhookEnv: 'SLACK_WEBHOOK_URL',
+    stateDb: join(dir, 'state.sqlite'), reposRoot: join(dir, 'repos'), worktreeRoot: join(dir, 'worktrees'),
+    repoBase: remoteBase, defaultBaseRef: 'main', reapIntervalMs: 0, leaseDurationMs: 86400000,
+    allowlist: ['trusted-user'], requireLabel: 'agent:ready',
+    workers: {
+      codex: { program: 'node', args: ['-e', 'console.log("codex-ran")'], createsTask: true, allowedPaths: ['app/src/**'], envAllowlist: ['PATH', 'HOME'] },
+    },
+    rules: [
+      { id: 'codex-on-ready-label', when: { events: ['pull_request'], actions: ['labeled'] }, worker: 'codex', authorize: 'label' },
+    ],
+  };
+  writeFileSync(join(dir, 'config.json'), JSON.stringify(cfg));
+  const child = spawn('node', ['server.mjs'], {
+    cwd: routerDir,
+    env: { ...process.env, CONFIG_PATH: join(dir, 'config.json'), GITHUB_WEBHOOK_SECRET: SECRET, SLACK_WEBHOOK_URL: 'https://hooks.slack.com/services/REPLACE_WITH_REAL_TOKEN', DRY_RUN: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.stderr.on('data', () => {});
+  try {
+    await waitFor(() => httpRequest(port, { method: 'GET', path: '/health' }).then((r) => r.status === 200), 6000);
+
+    // PR head ref = feat/real, but the envelope claims a different task branch.
+    const envelope = `---
+schema_version: 1
+agent: hermes
+to: codex
+repo: sonoran-solutions/dualdex
+issue: "7"
+branch: feat/something-else
+base_sha: ${baseSha}
+state: planned
+task: Fix
+acceptance: |
+  ok
+---`;
+    const body = JSON.stringify({
+      action: 'labeled',
+      sender: { login: 'trusted-user' },
+      repository: { full_name: repoSlug },
+      label: { name: 'agent:ready' },
+      pull_request: { number: 7, title: 'Fix', body: envelope, labels: [{ name: 'agent:ready' }], head: { ref: 'feat/real', sha: baseSha }, base: { ref: 'main', sha: baseSha } },
+    });
+    const res = await httpRequest(port, { headers: { 'X-GitHub-Event': 'pull_request', 'X-GitHub-Delivery': 'd-pr-code', 'X-Hub-Signature-256': sign(SECRET, body) }, body });
+    assert(res.status === 422 && res.body.reason === 'envelope does not match event context', `PR branch mismatch refused: ${JSON.stringify(res.body)}`);
+    assert(JSON.stringify(res.body.errors).includes('does not match event branch'), 'errors mention branch mismatch');
   } finally {
     child.kill('SIGTERM');
     await new Promise((r) => child.on('close', r));

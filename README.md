@@ -165,9 +165,10 @@ See [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) for the core implem
 
 The control plane (HMAC, dedupe, authorization, SQLite state, safe `shell: false`
 dispatch, worktrees + named branches + lease, base-ref movement guard, worker
-env allowlist, verified base SHA + envelope cross-check, single-lease semantics)
-is implemented and tested (`node test.mjs` → 27 passing). It is
-**not yet production-safe** for unattended use until these remain:
+env allowlist, live-remote base tracking, envelope/PR-branch + lifecycle
+cross-check, two-scope path policy, retry-reconstructed clean worktree,
+single-lease semantics) is implemented and tested (`node test.mjs` → 37 passing).
+It is **not yet production-safe** for unattended use until these remain:
 
 - GitHub Actions as the required-check authority (M2.1 `ci.sh` contract);
 - GitHub Rulesets so required checks/review cannot be bypassed by normal agent
@@ -175,9 +176,9 @@ is implemented and tested (`node test.mjs` → 27 passing). It is
 - Hermes repair wiring with minimum-environment leases (M2.2), plus the
   deliberate-failure M2.3 tests;
 
-Also confirm ORCH-080 (verify lease ownership before push) before wide autonomous
-use. Do not expose the router publicly or give it unattended code-editing
-authority until the above are complete.
+ORCH-080 (verify lease ownership before push) remains open: the pre-push guard is a
+cooperative layer, not router-owned push verification. Do not expose the router
+publicly or give it unattended code-editing authority until the above are complete.
 
 ## Definition of success
 

@@ -108,7 +108,7 @@ export function validBranchName(name) {
 
 // Cross-check the parsed envelope against the normalized event context / router
 // state where applicable (repo, issue, branch, allowed_paths). base_sha is
-// cross-checked separately against the resolved base SHA in dispatch.
+// cross-checked separately against the resolved live base SHA in dispatch.
 export function validateEnvelopeContext(envelope, ctx) {
   const errors = [];
   if (!envelope) return { ok: false, errors: ['missing envelope'] };
@@ -123,6 +123,12 @@ export function validateEnvelopeContext(envelope, ctx) {
   if (!validBranchName(envelope.branch)) {
     errors.push(`envelope branch '${envelope.branch}' is not a valid branch name`);
   }
+  // PR head-branch cross-check: when the event carries a known branch (e.g. the PR
+  // head ref), the envelope's task branch MUST equal it. There is no alternate
+  // trusted task-branch mapping yet, so this fails closed on mismatch.
+  if (ctx.branch && envelope.branch && ctx.branch !== envelope.branch) {
+    errors.push(`envelope branch '${envelope.branch}' does not match event branch '${ctx.branch}'`);
+  }
   if (envelope.allowed_paths !== undefined && envelope.allowed_paths !== null && envelope.allowed_paths !== '') {
     if (!Array.isArray(envelope.allowed_paths) || !envelope.allowed_paths.every((p) => typeof p === 'string' && p.trim() !== '')) {
       errors.push('envelope allowed_paths must be a list of non-empty path strings');
@@ -131,11 +137,34 @@ export function validateEnvelopeContext(envelope, ctx) {
   return { ok: errors.length === 0, errors };
 }
 
-// Effective allowed paths for the push guard = the task scope (envelope
-// `allowed_paths`) when present, otherwise the worker-global scope. The task
-// scope binds, so a code task cannot widen to the worker-global baseline.
-export function effectiveAllowedPaths(envelope, workerAllowedPaths = []) {
-  const worker = Array.isArray(workerAllowedPaths) ? workerAllowedPaths.filter((p) => typeof p === 'string' && p.trim()) : [];
-  const env = Array.isArray(envelope?.allowed_paths) ? envelope.allowed_paths.filter((p) => typeof p === 'string' && p.trim()) : [];
-  return env.length ? env : worker;
+// Path scoping is TWO independent scopes, never a single "effective" list:
+//   worker = worker/repository baseline (MAXIMUM trusted boundary)
+//   task   = optional additional narrowing boundary from the envelope
+// A task can never widen the worker baseline because both are enforced per file.
+export function pathScopes(envelope, workerAllowedPaths = []) {
+  const worker = (Array.isArray(workerAllowedPaths) ? workerAllowedPaths : []).filter((p) => typeof p === 'string' && p.trim() !== '');
+  const task = (Array.isArray(envelope?.allowed_paths) ? envelope.allowed_paths : []).filter((p) => typeof p === 'string' && p.trim() !== '');
+  return { worker, task };
+}
+
+// A brand-new task (no prior router state) must start in a state that can legally
+// reach `in_progress` through the documented lifecycle. planned is preferred; a
+// trusted agent:ready signal is what authorizes the task, so 'authorized' is also
+// accepted deliberately. We do NOT accept every non-terminal enum value: a new task
+// declaring done/review/verification/escalated/blocked/in_progress implies a prior
+// lifecycle the router has no record of and is refused.
+export const ACCEPTED_NEW_TASK_STATES = ['planned', 'authorized', 'assigned'];
+export function validateNewTaskState(state) {
+  if (!ACCEPTED_NEW_TASK_STATES.includes(state)) {
+    return { ok: false, errors: [`a new task must start in one of: ${ACCEPTED_NEW_TASK_STATES.join(', ')}; got '${state}'`] };
+  }
+  return { ok: true, errors: [] };
+}
+
+// May an existing task be dispatched to a fresh execution (i.e. enter `in_progress`)?
+// A same-state in_progress re-run is allowed (a worker may have crashed without
+// marking blocked); otherwise only a documented legal transition into in_progress.
+// `done` stays terminal (no reopen operation exists).
+export function canEnterInProgress(existingState) {
+  return existingState === 'in_progress' || legalTransition(existingState, 'in_progress');
 }

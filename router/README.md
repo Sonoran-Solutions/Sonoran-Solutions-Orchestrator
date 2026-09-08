@@ -37,11 +37,13 @@ router/
 | SQLite `tasks`, `runs`, `deliveries`, `leases` (state survives restart) | ✅ |
 | Handoff envelope parser/validator (`schema_version: 1`, required fields, legal transitions) | ✅ |
 | Per-task git worktree + **named task branch** + lease + allowed-path / base-ref movement pre-push guard | ✅ (create/reap/guard, fail-closed) |
-| Verified base SHA before worktree + refuse-on-unresolvable base SHA | ✅ |
-| Envelope/context cross-check (repo/issue/branch/allowed_paths/base_sha) + task-scope allowed paths | ✅ |
+| Live-remote base tracking: refresh + verify base SHA against `refs/remotes/origin/<baseRef>`, stale base refused | ✅ |
+| Envelope/context cross-check (repo/issue/branch/allowed_paths/base_sha, PR-head branch) | ✅ |
+| Path policy: worker baseline AND task scope enforced per file (task cannot widen worker baseline) | ✅ |
+| Retry lifecycle: clean worktree reconstructed from authoritative Git state, incompatible branch fails closed | ✅ |
 | Exactly one active lease per task; stale lease never reaps an owned worktree | ✅ |
 | Worker env hygiene: allowlist-only environment (no router-secret leakage) | ✅ |
-| Tests: 27 passing (`node test.mjs`) | ✅ |
+| Tests: 37 passing (`node test.mjs`) | ✅ |
 
 A random public issue/PR **cannot** launch a worker: it needs a valid signature,
 an untrusted actor is rejected, a code-editing dispatch additionally needs a
@@ -54,6 +56,9 @@ valid handoff envelope, and the `agent:ready` path requires a trusted labeler.
 - **M2.1 CI contract** (`ci.sh`) and **M2.2 Hermes install** remain open.
 - **Body-limit / concurrency / timeout paths** are implemented but exercised only
   indirectly by the HTTP integration test.
+- **ORCH-080 (router-owned lease verification before push)** remains open. The
+  pre-push guard is a *cooperative* layer; router-owned push verification does not
+  exist yet.
 
 Note on ORCH-081/083: both **are wired**. The pre-push guard records the task's
 base ref and blocks a push when the live remote base tip moved from the recorded
@@ -113,6 +118,36 @@ webhook secret. `SONORAN_TASK_ID` and `SONORAN_WORKTREE` are always added.
 `defaultBaseRef` (default `"main"`) names which branch a task is based on,
 falling back to the PR base ref when the event carries one.
 
+### Allowed-path policy (two scopes, never widening)
+
+Path scope is two independent scopes, both enforced per changed file by the
+cooperative pre-push guard:
+
+- **worker/repository baseline** = the worker's `allowedPaths` (the MAXIMUM trusted
+  boundary). `.sonoran-worker-allowed-paths`.
+- **task scope** = the envelope's `allowed_paths` (an OPTIONAL additional narrowing
+  boundary). `.sonoran-task-allowed-paths`.
+
+A file must match BOTH when a task scope exists. A task `allowed_paths` of `*` can
+**never** widen the worker baseline. If a code worker has an empty baseline, the
+dispatch fails closed.
+
+> Note: this Git hook is a **cooperative** enforcement layer (a worker can tamper
+> with its own hook/worktree). It is not router-owned push verification, so it is
+> not an unbypassable security boundary. ORCH-080 (router-owned lease verification
+> before push) remains open.
+
+### Worktree retry lifecycle
+
+Each new execution attempt reconstructs a clean named worktree from authoritative
+Git state (`prepareWorktreeForRun`): it removes any prior worktree for the task,
+refreshes the remote, and either uses the task branch from origin (only if it is
+compatible with the verified base — otherwise it fails closed and refuses rather
+than auto-rebasing/merging) or recreates it from the verified base SHA. A retry
+never inherits dirt, local-only commits, an old base, or the wrong branch. The
+worktree must be on the expected named branch, non-detached, clean, and at the
+expected starting commit before a worker is launched.
+
 ### Rules
 
 ```jsonc
@@ -146,10 +181,11 @@ cd router
 node test.mjs
 ```
 
-Covers handoff parsing/validation (valid, missing, unknown schema, malicious,
-lists/block-scalars, state transitions), authorization, event normalization,
-SQLite dedupe/round-trip/idempotent task re-delivery, worktree create/reap and
-named-branch + safe-branch-name validation, base-ref movement + scope push-guard,
-shell-injection safety, worker env allowlist filtering, and a full HTTP
-integration flow (HMAC 401, untrusted 403, notify dispatch, dedupe, and the
-invalid-envelope 422 gate).
+Covers handoff parsing/validation, authorization, event normalization, SQLite
+state (dedupe/idempotent re-delivery/single active lease/stale-lease ownership),
+worktrees (named branch, safe branch names, live-remote base tracking, fetch
+failure fail-closed, retry-clean lifecycle, incompatible-branch fail-closed),
+two-scope push-guard enforcement, shell-injection safety, worker env allowlist
+filtering, and offline HTTP integration tests (HMAC/auth/dedupe/422 gates, a full
+issues:labeled code task that honors lifecycle + path policy, and a PR-context
+branch-mismatch refusal).

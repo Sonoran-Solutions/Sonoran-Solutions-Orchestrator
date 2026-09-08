@@ -20,7 +20,7 @@ or code-editing authority (that stays gated on M2 + Rulesets + human merge).
 - **ORCH-037/038/039** — Slack config moved outside worktrees
   (`~/.config/sonoran/orchestrator.env`), loaded as plain `KEY=VALUE` and never
   sourced/evaluated as Bash (verified with an injection test).
-- **ORCH-050…083 (control plane)** — router rebuilt and **tested (27/27)**:
+- **ORCH-050…083 (control plane)** — router rebuilt and **tested (37/37)**:
   - normalized event context (incl. base ref); body limit, timeout, concurrency,
     clean shutdown;
   - mandatory HMAC + delivery dedupe;
@@ -47,19 +47,31 @@ or code-editing authority (that stays gated on M2 + Rulesets + human merge).
   `repo-name + issue-number` task ID is now a deliberate state transition, not an
   `INSERT` collision 500 (`createTask` upserts; runs get an incremented
   `attempt`). Regression-tested.
-- **Verified base SHA + refuse-on-unresolvable** — a code task only launches once
-  a nonempty base SHA is resolved and verified against the clone (`resolveBaseSha`).
-  An issue with no resolvable base SHA is refused and returns 422. Regression-tested
-  (unit + offline end-to-end).
-- **Envelope/context cross-check** — envelope `repo`, `issue`, `branch`, and
-  `allowed_paths` are validated against the event context and the resolved base
-  SHA. Mismatches refuse the dispatch.
-- **Task-scope allowed paths** — the push guard uses the envelope's task
-  `allowed_paths` when present, not merely the worker-global baseline.
+- **Live-remote base tracking** — a code task resolves the CURRENT authoritative
+  remote base tip (`refs/remotes/origin/<baseRef>`) by explicitly refreshing the
+  remote (`git fetch --prune origin`) and fails closed if the fetch fails, the ref
+  is missing, or a provided/envelope base SHA is stale vs. the live tip. Regression
+  tests cover the stale-clone case (router clone at ABC, remote advances to DEF,
+  resolution returns DEF).
+- **Envelope/context cross-check** — envelope `repo`, `issue`, `branch`,
+  `allowed_paths`, and (a) PR-head-branch equality when the event carries a branch
+  are validated against the event context and the resolved base SHA. Mismatches
+  refuse the dispatch.
+- **Two-scope path policy** — worker/repository baseline is the MAXIMUM trusted
+  boundary; the envelope's task `allowed_paths` is an optional ADDITIONAL narrowing
+  boundary. A changed file must satisfy BOTH when both exist; a task `*` can never
+  widen the worker baseline. An empty worker baseline fails closed.
 - **Single active lease** — re-delivery releases prior active leases first; a
   stale lease never reaps a worktree a newer active lease still owns.
-- **done → in_progress rejected** — no explicit reopen operation exists, so a
-  finished task is not restarted by a re-delivered webhook (422 refusal).
+- **Retry reconstructs clean state** — each new attempt rebuilds the worktree from
+  authoritative Git state (no dirty/local-only commit/old-base/wrong-branch
+  inheritance); an incompatible remote task branch fails closed rather than
+  auto-rebasing/merging.
+- **Raw lifecycle enforcement** — a brand-new task must start in
+  `planned`/`authorized`/`assigned` (the trusted `agent:ready` signal is what
+  authorizes; `planned` is preferred); an existing task's retry must follow legal
+  transitions (`canEnterInProgress`), and `done` stays terminal (no reopen).
+  No explicit `done → in_progress` reopen.
 - **Fail-closed worktree branch** — `createWorktree` never silently falls back to
   a detached HEAD; if the named branch cannot be created/attached, the dispatch
   fails closed.
@@ -75,6 +87,8 @@ or code-editing authority (that stays gated on M2 + Rulesets + human merge).
   checks, install Hermes, run deliberate-failure tests. ORCH-094's *minimum
   environment* building block is in place; the Hermes wiring itself remains.
 - **M2.1 CI contract** and the **M2.2 Hermes install** are untouched this session.
+- **ORCH-080** (verify lease ownership before push) still open — the pre-push guard
+  is a cooperative layer; router-owned push verification does not exist yet.
 - **TOOL-021…029**: GitHub Rulesets on DualDex (required checks + review gate).
 
 ## How to run the control plane locally
