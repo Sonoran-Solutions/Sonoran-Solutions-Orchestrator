@@ -35,14 +35,10 @@ For M2:
 1. Define the DualDex canonical CI command(s).
 2. Run the same CI contract in GitHub Actions.
 3. Configure the router to allocate an authorized task/run/worktree lease.
-4. Install Hermes and the `fix-build` skill.
-5. Provide validated task context such as:
-   - task/run ID;
-   - isolated worktree path;
-   - branch/base SHA;
-   - allowed paths;
-   - canonical build command;
-   - attempt/max-attempt state.
+4. Install Hermes (see [INSTALL.md](INSTALL.md)) and the `fix-build` skill.
+5. The router provides validated task context as structured `SONORAN_*`
+   environment variables (task/run/lease ID, isolated worktree path, branch,
+   base SHA, allowed paths, canonical build command, attempt/max-attempt state).
 6. Keep orchestration secrets outside the task worktree.
 7. Start with **deliberately broken pilot branches** before real autonomous repair.
 
@@ -84,9 +80,19 @@ local canonical CI command
 
 ## Attempt policy
 
-The attempt ceiling should come from the task/router rather than be hard-coded into Hermes.
+The attempt ceiling comes from the router, not from Hermes. The control plane
+refuses attempt `N+1` before launching a worker, so a fourth autonomous repair
+attempt is impossible without human re-authorization.
 
-For the initial pilot, start low (for example **3 attempts**) and measure whether extra attempts produce useful fixes or just churn. Reaching the limit means escalation, not resetting the counter.
+For the initial pilot the limit is **3 attempts**. Reaching the limit means
+escalation, not resetting the counter.
+
+## Result contract
+
+Hermes writes a structured JSON result to `$SONORAN_RESULT_FILE` (status:
+`candidate_fix` / `no_fix` / `escalate` / `blocked`, plus evidence fields). The
+router interprets that result; `escalate`/`blocked` stop the autonomous loop.
+Free-form worker prose never mutates router state.
 
 ## Slack policy
 
@@ -105,8 +111,9 @@ Detailed logs belong in GitHub/task logs.
 
 | File | Purpose |
 |---|---|
-| `fix-build.skill.md` | Repair procedure, limits, scope rules, CI handoff, escalation. |
+| `fix-build.skill.md` | Repair procedure, `SONORAN_*` context, structured result, escalation. |
 | `triggers.md` | How Hermes should be awakened without bypassing task authorization/state. |
+| `INSTALL.md` | Install/version/config/upgrade + smoke test for the self-hosted machine. |
 
 ## Accuracy note
 

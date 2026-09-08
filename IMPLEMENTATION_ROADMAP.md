@@ -240,19 +240,19 @@ A signed, authorized test event can create **exactly one** durable task/run and 
 
 ## M2.1 — Define the DualDex CI contract
 
-- [ ] **ORCH-090** Choose canonical build command(s), e.g. `./ci.sh build` and `./ci.sh test`.
-- [ ] **ORCH-091** Make the commands deterministic/non-interactive.
-- [ ] **ORCH-092** Ensure a developer/agent can run them locally.
-- [ ] **ORCH-093** Add/update GitHub Actions to run the same CI contract.
-- [ ] **ORCH-094** Configure required checks for the pilot PR flow.
+- [x] **ORCH-090** Choose canonical build command(s): `./ci.sh build` / `./ci.sh test` / `./ci.sh all` (merged in DualDex #28).
+- [x] **ORCH-091** Make the commands deterministic/non-interactive.
+- [x] **ORCH-092** Ensure a developer/agent can run them locally.
+- [x] **ORCH-093** Add/update GitHub Actions to run the same CI contract (`Native & Unit Tests`, `Build Debug APK`).
+- [x] **ORCH-094** Configure required checks for the pilot PR flow (DualDex `protect-main` ruleset, verified by read-back).
 
 ## M2.2 — Hermes setup
 
-- [ ] **ORCH-095** Install/configure Hermes on the self-hosted machine.
-- [ ] **ORCH-096** Give Hermes only the task worktree and minimum required environment.
-- [ ] **ORCH-097** Update the fix-build skill to consume task/run/lease scope from the router.
-- [ ] **ORCH-098** Set a bounded repair limit (start with 3; increase only if evidence supports it).
-- [ ] **ORCH-099** Require escalation for API/schema/product/security decisions.
+- [x] **ORCH-095** Install/configure Hermes on the self-hosted machine (`hermes-agent` v0.21.1, `~/.hermes`).
+- [x] **ORCH-096** Give Hermes only the task worktree and minimum required environment (structured `SONORAN_*` metadata + env allowlist).
+- [x] **ORCH-097** Update the fix-build skill to consume task/run/lease scope from the router (structured result file contract).
+- [x] **ORCH-098** Set a bounded repair limit (control-plane enforced `maxAttempts: 3`; attempt 4 refused).
+- [x] **ORCH-099** Require escalation for API/schema/product/security decisions (`escalate`/`blocked` stop the autonomous loop).
 
 ## M2.3 — Deliberate failure tests
 

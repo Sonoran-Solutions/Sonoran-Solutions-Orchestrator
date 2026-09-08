@@ -1,6 +1,6 @@
 ---
 name: fix-build
-description: Diagnose and attempt bounded mechanical repairs for an authorized task/CI failure, then rely on independent GitHub Actions verification and escalate when judgment is required.
+description: Diagnose and attempt one bounded mechanical repair for an authorized task/CI failure, write a structured JSON result, then stop. Escalate (never guess) when the fix requires API/schema/product/security judgment, exceeds scope, or reaches the attempt limit.
 ---
 
 # fix-build — bounded CI repair
@@ -11,112 +11,121 @@ Your job is narrow:
 
 1. reproduce the assigned build/test failure;
 2. attempt the smallest mechanical repair within the task's allowed scope;
-3. push a candidate fix for independent CI verification;
+3. record a structured JSON result — never rely on prose to change task state;
 4. stop and escalate when the problem requires judgment, exceeds scope, or reaches the attempt limit.
 
 You are **not** the product owner, architecture owner, reviewer, or final CI authority.
 
-## Required task context
+## Required task context (router-provided, via environment)
 
-The orchestrator should provide validated task/run context such as:
+The router launches you with only these structured `SONORAN_*` variables (plus a minimal `PATH`/`HOME` allowlist). Read them; do not assume a shared checkout.
 
-- `TASK_ID` — stable task identifier;
-- `RUN_ID` — current repair execution identifier;
-- `HERMES_WATCH_REPO` — isolated task worktree, not a shared checkout;
-- `HERMES_BUILD_CMD` — canonical local build/test command;
-- `WATCH_BRANCH` — assigned task branch;
-- `BASE_SHA` — expected task/base state;
-- `ALLOWED_PATHS` — task path scope supplied by the router/envelope;
-- `ATTEMPT` / `MAX_ATTEMPTS` — bounded attempt state;
-- issue/PR link or identifier for handoff/reporting.
+- `SONORAN_TASK_ID` — stable task identifier;
+- `SONORAN_RUN_ID` — current repair execution identifier;
+- `SONORAN_LEASE_ID` — lease ownership reference;
+- `SONORAN_WORKTREE` — isolated task worktree (NOT the repository root);
+- `SONORAN_REPO` — repository identity;
+- `SONORAN_BRANCH` — assigned task branch;
+- `SONORAN_BASE_SHA` — verified base state;
+- `SONORAN_ATTEMPT` — current attempt (1-based);
+- `SONORAN_MAX_ATTEMPTS` — hard attempt ceiling (initial pilot: 3);
+- `SONORAN_ALLOWED_PATHS` — worker/repository baseline path scope;
+- `SONORAN_TASK_PATHS` — optional task narrowing scope (may be empty);
+- `SONORAN_BUILD_CMD` — canonical local build/test command;
+- `SONORAN_RESULT_FILE` — path where you MUST write your structured JSON result.
 
-Slack credentials and other orchestration secrets should **not** be sourced from files inside the task worktree.
+Router-only secrets (webhook signing secret, Slack webhook URL, GitHub admin
+credentials) are **never** in your environment.
 
 ## Before editing
 
-1. Confirm the worktree/branch matches the assigned task.
-2. Confirm the task lease is still valid.
-3. Confirm the expected base/branch state has not moved unexpectedly.
-4. Read the validated handoff envelope and acceptance criteria.
-5. Run the canonical build/test command and reproduce the failure.
+1. `cd` into `$SONORAN_WORKTREE` and confirm it is the assigned worktree.
+2. Confirm `$SONORAN_BRANCH` / `$SONORAN_BASE_SHA` match the checkout; if the
+   branch moved or the base is unexpected, stop and escalate.
+3. Confirm the task lease is still valid (you have `$SONORAN_LEASE_ID`).
+4. Run `$SONORAN_BUILD_CMD` and reproduce the failure.
 
-If the lease is stale, the branch moved unexpectedly, or the failure cannot be reproduced, stop and report/escalate. Do not guess.
+If the failure cannot be reproduced, the branch moved unexpectedly, or the
+worktree is wrong, stop and report/escalate. Do not guess.
 
-## Repair loop
+## Repair loop (one attempt)
 
-1. **Collect the failure.** Focus on concrete compiler/test/runtime evidence.
-2. **Classify it.** Decide whether it appears mechanical and within scope.
-3. **Form one small hypothesis.** Do not redesign unrelated code.
-4. **Check scope.** All intended changes must stay within `ALLOWED_PATHS`.
+1. **Collect the failure** — focus on concrete compiler/test/runtime evidence.
+2. **Classify it** — is it mechanical and within scope?
+3. **Form one small hypothesis** — do not redesign unrelated code.
+4. **Check scope** — every intended change must stay within `ALLOWED_PATHS`
+   (and `TASK_PATHS` when non-empty). Never widen scope yourself.
 5. **Patch the smallest plausible change.**
 6. **Run the canonical command again.**
-7. If the result regresses or creates additional failures, revert the attempt before trying another hypothesis.
-8. If the local result is green/improved, commit and push the candidate repair.
-9. Hand the task to **independent GitHub Actions verification**. A local green run is not sufficient to declare the task complete.
-10. If required GitHub checks fail, continue only if the task is still within the allowed attempt/time budget and the next fix remains mechanical.
+7. If it regresses or adds failures, revert this attempt before forming a new
+   hypothesis.
+8. If locally green/improved, commit the candidate in the worktree (do NOT merge).
+9. Hand the task to **independent GitHub Actions verification** — a local green
+   run is not authoritative and never marks the task complete.
+10. Write your structured result to `$SONORAN_RESULT_FILE` and exit 0.
 
 ## Hard limits
 
-- Use the orchestrator-provided `MAX_ATTEMPTS`; for the initial pilot, start with a low value such as **3**.
-- Never reset/increase the attempt counter yourself.
-- Never loop forever.
+- `$SONORAN_MAX_ATTEMPTS` is the ceiling. Start at **3** for the pilot.
+- Never reset/increase the attempt counter; the router owns it.
 - One diagnosis/hypothesis per attempt.
-- Never widen `ALLOWED_PATHS` yourself.
-- Never edit orchestration secrets/configuration outside the assigned task worktree.
+- Never widen `ALLOWED_PATHS` or `TASK_PATHS`.
+- Never edit orchestration secrets or anything outside the worktree.
 - Never force-push over unexpected branch movement.
 - Never merge your own repair.
 - Never weaken/delete required tests merely to make CI green.
 
 ## Escalate immediately when the fix requires
 
-- public API/behavior decisions;
-- schema or data migrations;
-- security/authentication policy;
-- broad dependency changes;
-- product semantics;
-- architecture rewrites;
-- scope outside `ALLOWED_PATHS`;
+- **public API behavior** decisions;
+- **wire/protocol format** changes;
+- **persistent storage / database schema** changes;
+- **migration behavior**;
+- **security / authentication / authorization**;
+- **privacy / secret handling**;
+- **user-visible product behavior** where acceptance criteria are ambiguous;
+- **destructive data behavior**;
+- **dependency/version policy** with meaningful compatibility consequences;
+- **broad refactoring** or architecture rewrites;
+- scope outside `ALLOWED_PATHS`/`TASK_PATHS`;
 - deleting/weakening meaningful tests;
 - a branch/base state that no longer matches the lease.
 
-## Escalation
+Also escalate when acceptance criteria conflict, when the required fix needs
+broader scope than allowed, when the evidence suggests the test itself is wrong
+(and resolving that needs product intent), or when you cannot establish a
+mechanical root cause confidently enough for a bounded repair.
 
-When you hit a judgment boundary or the attempt limit:
+## Structured result (REQUIRED)
 
-1. Stop editing.
-2. Update the canonical handoff envelope with:
-   - `agent: hermes`;
-   - `to: codex` (or `human` where policy requires it);
-   - `state: escalated` or `blocked`;
-   - current `attempt` / `max_attempts`;
-   - concise evidence and attempted fixes in `summary`;
-   - unchanged acceptance criteria;
-   - the current branch/base state.
-3. Release/end the repair lease according to router policy.
-4. Emit one concise escalation notification tied to the GitHub issue/PR.
+At the end of the attempt, write JSON to `$SONORAN_RESULT_FILE`:
 
-Do not keep trying after escalation.
+```json
+{
+  "status": "candidate_fix",
+  "attempt": 1,
+  "files_changed": ["app/src/.../Foo.kt"],
+  "commands_executed": ["./ci.sh test"],
+  "root_cause": "one-line hypothesis",
+  "summary": "one-line change summary",
+  "uncertainty": "what is still unknown",
+  "escalation_reason": ""
+}
+```
 
-## Success handoff
+`status` must be exactly one of:
 
-A successful Hermes run means:
+- `candidate_fix` — a bounded repair was committed in the worktree and local CI is green/improved;
+- `no_fix` — no mechanical fix was found within scope (a failed attempt; the router may retry within the budget);
+- `escalate` — the fix requires human judgment (set `escalation_reason` to the specific decision area);
+- `blocked` — the worktree/lease/base is invalid or the failure cannot be reproduced (set `escalation_reason`).
 
-1. the candidate repair is committed/pushed;
-2. the local canonical command is green;
-3. required GitHub Actions checks are green;
-4. the repair is handed to the configured reviewer/merge policy.
+The router reads this file and interprets it. Do **not** rely on free-form prose
+to mutate task state, and do **not** claim local green CI means GitHub Actions
+passed — GitHub Actions remains the independent authority.
 
-During the initial rollout, **human merge is still required** after review + CI.
+## Escalation / stop behavior
 
-## Reporting policy
-
-Avoid Slack spam.
-
-Default project-channel notifications should be limited to meaningful transitions such as:
-
-- repair started (optional if the router already posted assignment);
-- candidate ready / CI verification started;
-- blocked/escalated;
-- verified/review-ready.
-
-Detailed compiler output, retries, file lists, and hypotheses belong in GitHub/task logs rather than separate top-level Slack messages.
+When you return `escalate` or `blocked`, or when you have consumed
+`$SONORAN_MAX_ATTEMPTS`, the router stops the autonomous repair loop. Do not keep
+trying after escalation.

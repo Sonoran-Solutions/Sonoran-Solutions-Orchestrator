@@ -57,13 +57,13 @@ A human can look at Linear and understand what Sonoran Solutions is working on n
 
 **Goal:** make critical merge/branch policy independent from agent prompts and router behavior.
 
-- [ ] **TOOL-020** Inventory current default/release branches for active repos.
-- [ ] **TOOL-021** Configure a baseline ruleset for DualDex.
-- [ ] **TOOL-022** Require PRs before merge to the protected/default branch.
-- [ ] **TOOL-023** Require the canonical GitHub Actions checks once M2 CI is defined.
-- [ ] **TOOL-024** Block force pushes to protected branches.
-- [ ] **TOOL-025** Restrict direct pushes/bypass permissions to the minimum practical set.
-- [ ] **TOOL-026** Require review for agent-authored feature/fix work during the pilot.
+- [x] **TOOL-020** Inventory current default/release branches for active repos.
+- [x] **TOOL-021** Configure a baseline ruleset for DualDex (`protect-main`).
+- [x] **TOOL-022** Require PRs before merge to the protected/default branch.
+- [x] **TOOL-023** Require the canonical GitHub Actions checks once M2 CI is defined (`Native & Unit Tests`, `Build Debug APK`).
+- [x] **TOOL-024** Block force pushes to protected branches.
+- [x] **TOOL-025** Restrict direct pushes/bypass permissions to the minimum practical set (admin `RepositoryRole` bypass only).
+- [ ] **TOOL-026** Require review for agent-authored feature/fix work during the pilot (deliberately `0` approvals for the solo-repo pilot).
 - [ ] **TOOL-027** Verify the router/agent credential cannot silently bypass the normal merge policy.
 - [ ] **TOOL-028** Test a failing required check and confirm merge is blocked.
 - [ ] **TOOL-029** Test an unauthorized direct push/merge path and confirm it is blocked where intended.

@@ -45,7 +45,8 @@ router/
 | Existing-task envelope state must equal persisted task state (fail closed on mismatch); done stays terminal | ✅ |
 | Exactly one active lease per task; stale lease never reaps an owned worktree | ✅ |
 | Worker env hygiene: allowlist-only environment (no router-secret leakage) | ✅ |
-| Tests: 41 passing (`node test.mjs`) | ✅ |
+| Hermes bounded repair worker: structured `SONORAN_*` context, structured result file, attempt limit, escalation terminal | ✅ |
+| Tests: 50 passing (`node test.mjs`) | ✅ |
 
 A random public issue/PR **cannot** launch a worker: it needs a valid signature,
 an untrusted actor is rejected, a code-editing dispatch additionally needs a
@@ -53,14 +54,15 @@ valid handoff envelope, and the `agent:ready` path requires a trusted labeler.
 
 ## Not yet implemented (do not rely on these)
 
-- **GitHub Actions as the required-check authority** and **Hermes repair** are
-  M2 (see the roadmap) — not part of this control-plane milestone.
-- **M2.1 CI contract** (`ci.sh`) and **M2.2 Hermes install** remain open.
+- **GitHub Actions as the required-check authority** is wired for DualDex (the
+  `Native & Unit Tests` + `Build Debug APK` checks are required on `main`); the
+  router's own CI-event consumption is not yet built.
+- **Hermes candidate push** (ORCH-080, router-owned lease verification before
+  push) remains open. The pre-push guard is a *cooperative* layer; the M2.2
+  worker is wired to repair locally and return a structured result, but does not
+  push. Push is deferred to the M2.4 pilot integration.
 - **Body-limit / concurrency / timeout paths** are implemented but exercised only
   indirectly by the HTTP integration test.
-- **ORCH-080 (router-owned lease verification before push)** remains open. The
-  pre-push guard is a *cooperative* layer; router-owned push verification does not
-  exist yet.
 
 Note on ORCH-081/083: both **are wired**. The pre-push guard records the task's
 base ref and blocks a push when the live remote base tip moved from the recorded
@@ -119,6 +121,36 @@ webhook secret. `SONORAN_TASK_ID` and `SONORAN_WORKTREE` are always added.
 
 `defaultBaseRef` (default `"main"`) names which branch a task is based on,
 falling back to the PR base ref when the event carries one.
+
+### Repair workers (Hermes)
+
+A worker with `"repair": true` is a bounded repair worker (and is inherently a
+code worker, so it always gets an envelope + worktree + lease). It additionally:
+
+- receives structured `SONORAN_*` context instead of a free-form prompt: task/run/
+  lease IDs, repo, branch, base SHA, attempt/max-attempts, allowed/task paths,
+  canonical build command, and `SONORAN_RESULT_FILE`;
+- must write a structured JSON result to `SONORAN_RESULT_FILE` with `status` in
+  `candidate_fix | no_fix | escalate | blocked`;
+- is subject to a control-plane-enforced attempt limit (`maxAttempts`, default
+  `3`): attempt `N+1` is refused before a worker launches and the task is
+  escalated;
+- has `escalate`/`blocked` treated as terminal for the autonomous loop: the next
+  automatic dispatch is refused until a human re-authorizes.
+
+```jsonc
+"hermes": {
+  "program": "hermes",
+  "args": ["-z", "{{prompt}}", "--in", "{{worktree}}", "--skills", "fix-build", "--yolo"],
+  "createsTask": true, "repair": true, "maxAttempts": 3,
+  "buildCmd": "./ci.sh test",
+  "allowedPaths": ["app/src/**", "native/**", "*.md"],
+  "envAllowlist": ["PATH", "HOME"]
+}
+```
+
+The router interprets the structured result; free-form worker prose never mutates
+router state.
 
 ### Allowed-path policy (two scopes, never widening)
 

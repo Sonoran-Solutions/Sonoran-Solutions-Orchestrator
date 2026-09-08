@@ -1,10 +1,36 @@
-# Status — control-plane wiring (this session)
+# Status — M2.1 CI contract + M2.2 Hermes setup (this session)
 
 Work completed against [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md).
-This is additive progress toward M1/M1.5; nothing here grants unattended merge
-or code-editing authority (that stays gated on M2 + Rulesets + human merge).
+M2.1 (canonical CI) and M2.2 (Hermes repair worker) are implemented; M2.3
+deliberate repair and M2.4 merge policy remain intentionally untouched.
 
-## Done
+## Done (this session — M2.1 / M2.2)
+
+- **M2.1 merged** — DualDex PR #28 (canonical `./ci.sh test/build/all`,
+  fail-closed submodule/compiler handling, GitHub Actions running the exact
+  contract) merged into `main` (`b0f733a`).
+- **ORCH-094** — DualDex `protect-main` ruleset configured and read back:
+  PR required, required checks `Native & Unit Tests` + `Build Debug APK`,
+  `required_approving_review_count: 0`, force-push + deletion blocked, admin
+  bypass retained, no auto-merge.
+- **Follow-up issue** — `dualdex#29` (QuickJS calculator host-CI coverage gap),
+  recorded, not implemented.
+- **ORCH-095** — Hermes agent installed/pinned: `v0.21.1` (`f03ed94a`),
+  launcher `~/.local/bin/hermes`, data `~/.hermes`; `hermes --version` smoke OK.
+  Runbook: [`hermes-watch/INSTALL.md`](hermes-watch/INSTALL.md).
+- **ORCH-096/097** — Hermes worker receives an explicit `SONORAN_*` task/run/lease
+  context (worktree, repo, branch, base SHA, allowed paths, attempt/max, build
+  command, result file) via the env allowlist; the fix-build skill writes a
+  structured JSON result (`candidate_fix`/`no_fix`/`escalate`/`blocked`).
+- **ORCH-098** — control-plane-enforced `maxAttempts: 3`; attempt 4 is refused
+  before a worker launches and the task is escalated.
+- **ORCH-099** — `escalate`/`blocked` results stop the autonomous repair loop;
+  a subsequent automatic dispatch is refused (human re-authorization required).
+- **Tests** — router suite is `50 passed, 0 failed` (9 new Hermes plumbing tests
+  against a fake executable: structured context, secret exclusion, attempt
+  boundary, escalation terminal, blocked refusal, nonzero-exit durability).
+
+## Done (earlier sessions)
 
 - **ORCH-003** — stale `devils-17` → `Sonoran-Solutions` links fixed in
   `dualdex/README.md` (2 occurrences). The orchestrator's own `config.example.json`
@@ -98,13 +124,14 @@ or code-editing authority (that stays gated on M2 + Rulesets + human merge).
   remotes, Slack links, tokens — verify once integrations are actually wired.
 - **M0 manual passes** (ORCH-010…019): Codex plan, human-steered Antigravity
   implementation, Codex review — driven by the human, not this session.
-- **M2** (ORCH-090…110): define `ci.sh` for DualDex, add GitHub Actions required
-  checks, install Hermes, run deliberate-failure tests. ORCH-094's *minimum
-  environment* building block is in place; the Hermes wiring itself remains.
-- **M2.1 CI contract** and the **M2.2 Hermes install** are untouched this session.
+- **M2.3** (ORCH-100…105) deliberate repair tests — intentionally not started.
+- **M2.4** (ORCH-106…110) review/merge policy — not started.
 - **ORCH-080** (verify lease ownership before push) still open — the pre-push guard
-  is a cooperative layer; router-owned push verification does not exist yet.
-- **TOOL-021…029**: GitHub Rulesets on DualDex (required checks + review gate).
+  is a cooperative layer; router-owned push verification does not exist yet, so
+  Hermes's eventual candidate push path is deliberately deferred.
+- **TOOL-026…029** (review gate + ruleset failure/push tests on DualDex) — the
+  baseline ruleset (TOOL-021…025) is done; review-gate and adversarial tests
+  remain.
 
 ## How to run the control plane locally
 

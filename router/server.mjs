@@ -11,12 +11,14 @@
 //   - timeout + concurrency limits and clean shutdown.
 import http from 'node:http';
 import crypto from 'node:crypto';
+import { join } from 'node:path';
 import { loadConfig } from './lib/config.mjs';
 import { normalize, templateVars } from './lib/events.mjs';
 import { parseEnvelope, validateEnvelopeContext, pathScopes, validateNewTaskState, validateExistingTaskState, canEnterInProgress } from './lib/handoff.mjs';
 import { authorize } from './lib/auth.mjs';
 import * as state from './lib/state.mjs';
 import { resolveProgram, interpolateArgs, runWorker, buildWorkerEnv } from './lib/workers.mjs';
+import { DEFAULT_MAX_REPAIR_ATTEMPTS, DEFAULT_REPAIR_BUILD_CMD, readRepairResult, classifyRepairResult, attemptExceeded } from './lib/hermes.mjs';
 import { ensureRepo, prepareWorktreeForRun, installPushGuard, removeWorktreePath, resolveBaseSha, resolveCommitSha } from './lib/worktrees.mjs';
 
 const cfg = loadConfig();
@@ -95,7 +97,9 @@ async function dispatch(rule, ctx) {
   const workerCfg = (cfg.workers || {})[rule.worker];
   if (!workerCfg) return { ok: false, reason: `unknown worker '${rule.worker}'` };
 
-  const isCodeWorker = !!workerCfg.createsTask;
+  // A repair worker is inherently a code worker: it edits the task worktree, so
+  // it must always go through the envelope + worktree + lease reservation path.
+  const isCodeWorker = !!workerCfg.createsTask || !!workerCfg.repair;
 
   // Code-editing dispatch requires a valid handoff envelope (ORCH-073..076).
   let envelope = null;
@@ -116,6 +120,8 @@ async function dispatch(rule, ctx) {
   //   -> install path/base guard -> create one active lease -> create one running
   //   run -> launch worker (outside the lock).
   let taskId = null; let worktree = null; let runId = null;
+  let attempt = null; let leaseId = null; let baseSha = null;
+  let workerAllowedPaths = []; let taskAllowedPaths = [];
   if (isCodeWorker) {
     taskId = sanitizeTaskId(ctx.repo, ctx.issueNumber, ctx.headSha);
     const baseRef = ctx.baseRef || cfg.defaultBaseRef || 'main';
@@ -127,7 +133,7 @@ async function dispatch(rule, ctx) {
     // Two independent path scopes: worker/repository baseline (REQUIRED maximum)
     // AND the optional task narrowing boundary. A task can never widen the worker
     // baseline; an omitted task scope means worker-baseline-only (not deny-all).
-    const { worker: workerAllowedPaths, task: taskAllowedPaths } = pathScopes(envelope, workerCfg.allowedPaths);
+    ({ worker: workerAllowedPaths, task: taskAllowedPaths } = pathScopes(envelope, workerCfg.allowedPaths));
     if (workerAllowedPaths.length === 0) {
       return refusal('code worker has an empty allowedPaths baseline; refusing to launch');
     }
@@ -175,6 +181,20 @@ async function dispatch(rule, ctx) {
         if (!ns.ok) return refusal('invalid initial task state', { errors: ns.errors });
       }
 
+      // Bounded repair worker (Hermes) gates (ORCH-098/099). A task that a prior
+      // repair escalated/blocked, or one that has exhausted its attempt budget,
+      // must never be auto-dispatched again — human intervention is required.
+      if (workerCfg.repair) {
+        const maxAttempts = Number(workerCfg.maxAttempts || DEFAULT_MAX_REPAIR_ATTEMPTS);
+        if (existing && (existing.state === 'escalated' || existing.state === 'blocked')) {
+          return refusal(`task is '${existing.state}' — autonomous repair requires human re-authorization`);
+        }
+        if (attemptExceeded(state.nextAttempt(db, taskId), maxAttempts)) {
+          state.updateTaskState(db, taskId, 'escalated');
+          return refusal(`repair attempt limit reached (max ${maxAttempts}); task escalated to human`);
+        }
+      }
+
       // Reservation: no live execution remains, so it is now safe to release any
       // remaining active lease, upsert the task, and reserve a fresh execution.
       state.releaseActiveLeasesForTask(db, taskId);
@@ -195,12 +215,13 @@ async function dispatch(rule, ctx) {
         installPushGuard(wt, { workerAllowedPaths, taskAllowedPaths, baseSha, baseRef });
         const attempt = state.nextAttempt(db, taskId);
         const rid = crypto.randomUUID();
+        const lid = crypto.randomUUID();
         state.createLease(db, {
-          id: crypto.randomUUID(), taskId, worktree: wt, baseSha, owner: envelope.agent,
+          id: lid, taskId, worktree: wt, baseSha, owner: envelope.agent,
           sourceRepo, expiresAt: new Date(Date.now() + (cfg.leaseDurationMs || 86400000)).toISOString(),
         });
         state.createRun(db, { id: rid, taskId, agent: rule.worker, attempt, status: 'running' });
-        return { ok: true, worktree: wt, runId: rid };
+        return { ok: true, worktree: wt, runId: rid, attempt, leaseId: lid, baseSha };
       } catch (e) {
         log(`[router] worktree setup failed for ${taskId}: ${e.message}`);
         state.updateTaskState(db, taskId, 'blocked');
@@ -211,6 +232,9 @@ async function dispatch(rule, ctx) {
     if (reservation.refusal) return reservation;
     worktree = reservation.worktree;
     runId = reservation.runId;
+    attempt = reservation.attempt ?? null;
+    leaseId = reservation.leaseId ?? null;
+    baseSha = reservation.baseSha ?? null;
   }
 
   const vars = templateVars(ctx, {
@@ -226,20 +250,70 @@ async function dispatch(rule, ctx) {
       : '',
   });
 
+  // Bounded repair workers (Hermes) receive structured task/run/lease context as
+  // explicit SONORAN_* metadata (never free-form env inheritance), plus a result
+  // file path the worker writes its structured outcome to. ORCH-096/097.
+  let repairResultFile = null;
+  if (workerCfg.repair) {
+    repairResultFile = worktree ? join(worktree, '.sonoran-repair-result.json') : null;
+    const maxAttempts = Number(workerCfg.maxAttempts || DEFAULT_MAX_REPAIR_ATTEMPTS);
+    const repairMeta = {
+      RUN_ID: runId,
+      LEASE_ID: leaseId,
+      REPO: ctx.repo,
+      BRANCH: envelope?.branch || ctx.branch || '',
+      BASE_SHA: baseSha,
+      ATTEMPT: attempt,
+      MAX_ATTEMPTS: maxAttempts,
+      ALLOWED_PATHS: workerAllowedPaths.join('\n'),
+      TASK_PATHS: taskAllowedPaths.join('\n'),
+      BUILD_CMD: workerCfg.buildCmd || DEFAULT_REPAIR_BUILD_CMD,
+      RESULT_FILE: repairResultFile,
+    };
+    vars.meta = repairMeta;
+  }
+
   const program = resolveProgram(workerCfg.program, cfg.__routerDir);
   const args = interpolateArgs(workerCfg.args || [], vars);
   // Never inherit every env var from the router process (ORCH-094): workers get
-  // only an explicit allowlist (PATH/HOME by default) plus their task/worktree.
-  const env = buildWorkerEnv(workerCfg, { taskId, worktree });
+  // only an explicit allowlist (PATH/HOME by default) plus their task/worktree
+  // and (for repair workers) the structured SONORAN_* metadata above.
+  const env = buildWorkerEnv(workerCfg, { taskId, worktree, meta: vars.meta || {} });
 
   const result = await runWorker(workerCfg, {
     program, args, cwd: worktree || cfg.__routerDir, env, timeoutMs: workerCfg.timeoutMs || cfg.defaultTimeoutMs,
   });
 
-  if (runId) state.updateRun(db, runId, { status: result.ok ? 'success' : 'failed', result: (result.stderr || result.stdout || result.error || '').slice(0, 2000) });
-  if (taskId && !result.ok) state.updateTaskState(db, taskId, 'blocked');
+  // Interpret the repair worker's structured result. The router — never the
+  // worker's prose — decides whether the autonomous repair loop continues.
+  let repairAction = null;
+  if (workerCfg.repair) {
+    repairAction = classifyRepairResult(readRepairResult(repairResultFile));
+  }
 
-  return { ok: result.ok, taskId, runId, worktree, output: (result.stderr || result.stdout || '').slice(0, 500) };
+  if (runId) {
+    let runStatus = 'failed';
+    if (result.ok) {
+      if (repairAction?.action === 'escalate') runStatus = 'escalated';
+      else if (repairAction?.action === 'blocked') runStatus = 'blocked';
+      else if (!workerCfg.repair || repairAction?.action === 'candidate_fix') runStatus = 'success';
+    }
+    state.updateRun(db, runId, { status: runStatus, result: (result.stderr || result.stdout || result.error || '').slice(0, 2000) });
+  }
+  if (taskId) {
+    if (workerCfg.repair) {
+      // Escalation/blocked are terminal for the autonomous loop; a plain failed
+      // attempt stays retryable (the attempt limit and escalation gate handle
+      // termination), so a failed repair never fabricates a blocked "success".
+      if (repairAction?.action === 'escalate') state.updateTaskState(db, taskId, 'escalated');
+      else if (repairAction?.action === 'blocked') state.updateTaskState(db, taskId, 'blocked');
+      else if (!result.ok) state.updateTaskState(db, taskId, 'in_progress');
+    } else if (!result.ok) {
+      state.updateTaskState(db, taskId, 'blocked');
+    }
+  }
+
+  return { ok: result.ok, taskId, runId, worktree, attempt, repairAction: repairAction?.action ?? null, output: (result.stderr || result.stdout || '').slice(0, 500) };
 }
 
 async function handlePost(raw, headers) {
