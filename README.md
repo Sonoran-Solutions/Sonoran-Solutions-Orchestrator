@@ -165,7 +165,8 @@ See [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) for the core implem
 
 The control plane (HMAC, dedupe, authorization, SQLite state, safe `shell: false`
 dispatch, worktrees + named branches + lease, base-ref movement guard, worker
-env allowlist) is implemented and tested (`node test.mjs` → 20 passing). It is
+env allowlist, verified base SHA + envelope cross-check, single-lease semantics)
+is implemented and tested (`node test.mjs` → 27 passing). It is
 **not yet production-safe** for unattended use until these remain:
 
 - GitHub Actions as the required-check authority (M2.1 `ci.sh` contract);

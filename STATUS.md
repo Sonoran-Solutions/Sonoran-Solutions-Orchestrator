@@ -20,7 +20,7 @@ or code-editing authority (that stays gated on M2 + Rulesets + human merge).
 - **ORCH-037/038/039** — Slack config moved outside worktrees
   (`~/.config/sonoran/orchestrator.env`), loaded as plain `KEY=VALUE` and never
   sourced/evaluated as Bash (verified with an injection test).
-- **ORCH-050…083 (control plane)** — router rebuilt and **tested (20/20)**:
+- **ORCH-050…083 (control plane)** — router rebuilt and **tested (27/27)**:
   - normalized event context (incl. base ref); body limit, timeout, concurrency,
     clean shutdown;
   - mandatory HMAC + delivery dedupe;
@@ -47,6 +47,22 @@ or code-editing authority (that stays gated on M2 + Rulesets + human merge).
   `repo-name + issue-number` task ID is now a deliberate state transition, not an
   `INSERT` collision 500 (`createTask` upserts; runs get an incremented
   `attempt`). Regression-tested.
+- **Verified base SHA + refuse-on-unresolvable** — a code task only launches once
+  a nonempty base SHA is resolved and verified against the clone (`resolveBaseSha`).
+  An issue with no resolvable base SHA is refused and returns 422. Regression-tested
+  (unit + offline end-to-end).
+- **Envelope/context cross-check** — envelope `repo`, `issue`, `branch`, and
+  `allowed_paths` are validated against the event context and the resolved base
+  SHA. Mismatches refuse the dispatch.
+- **Task-scope allowed paths** — the push guard uses the envelope's task
+  `allowed_paths` when present, not merely the worker-global baseline.
+- **Single active lease** — re-delivery releases prior active leases first; a
+  stale lease never reaps a worktree a newer active lease still owns.
+- **done → in_progress rejected** — no explicit reopen operation exists, so a
+  finished task is not restarted by a re-delivered webhook (422 refusal).
+- **Fail-closed worktree branch** — `createWorktree` never silently falls back to
+  a detached HEAD; if the named branch cannot be created/attached, the dispatch
+  fails closed.
 
 ## Not yet done (needs a human / next milestone)
 

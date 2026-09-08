@@ -21,6 +21,25 @@ export function fetchLatest(sourceRepo, branch = '--all') {
   runGit(sourceRepo, ['fetch', '--quiet', 'origin', ...(branch === '--all' ? ['--all'] : [branch])]);
 }
 
+// Resolve + verify a nonempty base SHA for a task BEFORE any worktree is created.
+// - If `providedSha` is given (event/base context or the envelope), it must resolve
+//   to a real commit object in the clone; short SHAs are expanded to full.
+// - Otherwise resolve the branch tip for `baseRef` from the remote.
+// Returns the full SHA (40 hex) or null if it cannot be resolved/verified. The
+// router refuses to launch a code task when this returns null.
+export function resolveBaseSha(sourceRepo, baseRef, { providedSha = '' } = {}) {
+  if (!sourceRepo || !baseRef) return null;
+  try { runGit(sourceRepo, ['fetch', '--quiet', 'origin', '--all']); } catch { /* best effort */ }
+  const target = providedSha ? `${providedSha}^{commit}` : `refs/heads/${baseRef}`;
+  try {
+    const sha = runGit(sourceRepo, ['rev-parse', '--verify', target]).trim();
+    if (!sha || !/^[0-9a-f]{40}$/i.test(sha)) return null;
+    return sha;
+  } catch {
+    return null;
+  }
+}
+
 // A git ref name must be path-safe and never a CLI flag. We reject anything that
 // isn't a conservative `[A-Za-z0-9._/-]` token, so envelope-supplied branch names
 // can never become argument injection for `git worktree add`.
@@ -46,9 +65,9 @@ export function createWorktree({ sourceRepo, worktreeRoot, taskId, baseSha, bran
   try {
     runGit(sourceRepo, ['worktree', 'add', '-b', safeBranch, dest, baseSha || 'HEAD']);
   } catch {
-    // Branch already exists (e.g. a prior attempt on a re-delivered task) — attach.
-    try { runGit(sourceRepo, ['worktree', 'add', dest, safeBranch]); }
-    catch { runGit(sourceRepo, ['worktree', 'add', '--detach', dest, baseSha || 'HEAD']); }
+    // Branch already exists (e.g. a prior attempt on a re-delivered task) — attach to it.
+    // Fail closed: if attach also fails we must NOT silently fall back to detached HEAD.
+    runGit(sourceRepo, ['worktree', 'add', dest, safeBranch]);
   }
   return dest;
 }

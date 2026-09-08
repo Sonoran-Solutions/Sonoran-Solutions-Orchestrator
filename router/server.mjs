@@ -13,11 +13,11 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import { loadConfig } from './lib/config.mjs';
 import { normalize, templateVars } from './lib/events.mjs';
-import { parseEnvelope } from './lib/handoff.mjs';
+import { parseEnvelope, legalTransition, validateEnvelopeContext, effectiveAllowedPaths } from './lib/handoff.mjs';
 import { authorize } from './lib/auth.mjs';
 import * as state from './lib/state.mjs';
 import { resolveProgram, interpolateArgs, runWorker, buildWorkerEnv } from './lib/workers.mjs';
-import { ensureRepo, createWorktree, installPushGuard, removeWorktreePath } from './lib/worktrees.mjs';
+import { ensureRepo, createWorktree, installPushGuard, removeWorktreePath, resolveBaseSha } from './lib/worktrees.mjs';
 
 const cfg = loadConfig();
 const PORT = cfg.port || 8090;
@@ -65,6 +65,10 @@ function sanitizeTaskId(repo, issueNumber, headSha) {
   return `${name}-${num || Date.now()}`;
 }
 
+function refusal(reason, extra = {}) {
+  return { ok: false, refusal: true, reason, ...extra };
+}
+
 async function dispatch(rule, ctx) {
   const workerCfg = (cfg.workers || {})[rule.worker];
   if (!workerCfg) return { ok: false, reason: `unknown worker '${rule.worker}'` };
@@ -75,32 +79,74 @@ async function dispatch(rule, ctx) {
   let envelope = null;
   if (isCodeWorker) {
     const parsed = parseEnvelope(ctx.bodyText);
-    if (!parsed.ok) return { ok: false, reason: 'invalid handoff envelope', errors: parsed.errors };
+    if (!parsed.ok) return refusal('invalid handoff envelope', { errors: parsed.errors });
     envelope = parsed.data;
   }
 
-  // Durable task + run + lease + worktree for code workers.
+  // Durable task + run + lease + worktree for code workers. Everything below FAILS
+  // CLOSED: if the base SHA can't be resolved/verified, the envelope disagrees with
+  // the event, the transition is illegal, or the worktree can't be created, we do
+  // NOT launch a worker and we do not silently detach the worktree.
   let taskId = null; let worktree = null; let runId = null;
   if (isCodeWorker) {
     taskId = sanitizeTaskId(ctx.repo, ctx.issueNumber, ctx.headSha);
     const baseRef = ctx.baseRef || cfg.defaultBaseRef || 'main';
-    const existedBefore = !!state.getTask(db, taskId);
+
+    // Cross-check envelope repo/issue/branch/allowed_paths against the event/state.
+    const cross = validateEnvelopeContext(envelope, ctx);
+    if (!cross.ok) return refusal('envelope does not match event context', { errors: cross.errors });
+
+    // Effective allowed paths use the TASK scope (envelope allowed_paths), not merely
+    // the worker-global scope.
+    const allowedPaths = effectiveAllowedPaths(envelope, workerCfg.allowedPaths);
+
+    // Resolve + verify a nonempty base SHA BEFORE the worktree is created; a code
+    // task with no resolvable base ref/SHA refuses to launch.
+    let sourceRepo;
+    try { sourceRepo = ensureRepo(ctx.repo, cfg.reposRoot, cfg.repoBase); }
+    catch (e) { log(`[router] repo unavailable for ${ctx.repo}: ${e.message}`); return refusal('repo is not available'); }
+
+    const contextBase = ctx.baseSha || '';
+    const envelopeBase = envelope.base_sha || '';
+    const baseSha = resolveBaseSha(sourceRepo, baseRef, { providedSha: contextBase || envelopeBase });
+    if (!baseSha) return refusal('no resolvable base SHA; refusing to launch a code task');
+    // The envelope's declared base_sha must agree with the resolved base.
+    if (envelopeBase) {
+      const envFull = resolveBaseSha(sourceRepo, baseRef, { providedSha: envelopeBase });
+      if (!envFull || envFull !== baseSha) return refusal('envelope base_sha does not match the resolved base SHA');
+    }
+
+    // Re-delivery must be a legal state transition; done -> in_progress is rejected
+    // unless an explicit reopen operation exists (none does yet).
+    const existing = state.getTask(db, taskId);
+    if (existing && !legalTransition(existing.state, 'in_progress')) {
+      return refusal(`illegal state transition '${existing.state}' -> 'in_progress'`);
+    }
+
     state.createTask(db, {
       id: taskId, repo: ctx.repo, issue: ctx.issueNumber != null ? String(ctx.issueNumber) : null,
       state: 'in_progress', owner: envelope.agent, branch: envelope.branch,
-      baseSha: ctx.baseSha || ctx.headSha, baseRef, risk: 'pilot',
+      baseSha, baseRef, risk: 'pilot',
     });
-    if (existedBefore) log(`[router] task ${taskId} already exists — deliberate retry/state transition`);
+    if (existing) log(`[router] task ${taskId} already exists — deliberate retry/state transition`);
+
+    try {
+      worktree = createWorktree({
+        sourceRepo, worktreeRoot: cfg.worktreeRoot, taskId, baseSha, branch: envelope.branch,
+      });
+      installPushGuard(worktree, { allowedPaths, baseSha, baseRef });
+    } catch (e) {
+      log(`[router] worktree setup failed for ${taskId}: ${e.message}`);
+      state.updateTaskState(db, taskId, 'blocked');
+      return refusal('worktree setup failed');
+    }
+
     const attempt = state.nextAttempt(db, taskId);
     runId = crypto.randomUUID();
     state.createRun(db, { id: runId, taskId, agent: rule.worker, attempt, status: 'running' });
 
-    const sourceRepo = ensureRepo(ctx.repo, cfg.reposRoot);
-    const baseSha = ctx.baseSha || ctx.headSha;
-    worktree = createWorktree({
-      sourceRepo, worktreeRoot: cfg.worktreeRoot, taskId, baseSha, branch: envelope.branch,
-    });
-    installPushGuard(worktree, { allowedPaths: workerCfg.allowedPaths || [], baseSha, baseRef });
+    // Exactly one active lease per task/worktree: release any previous one first.
+    state.releaseActiveLeasesForTask(db, taskId);
     state.createLease(db, {
       id: crypto.randomUUID(), taskId, worktree, baseSha, owner: envelope.agent,
       sourceRepo, expiresAt: new Date(Date.now() + (cfg.leaseDurationMs || 86400000)).toISOString(),
@@ -163,8 +209,8 @@ async function handlePost(raw, headers) {
   inFlight++;
   try {
     const result = await dispatch(rule, ctx);
-    log(`[router] rule=${rule.id} worker=${rule.worker} ok=${result.ok}${result.taskId ? ' task=' + result.taskId : ''}`);
-    if (result.reason === 'invalid handoff envelope') {
+    log(`[router] rule=${rule.id} worker=${rule.worker} ok=${result.ok}${result.refusal ? ' refusal=' + result.reason : ''}${result.taskId ? ' task=' + result.taskId : ''}`);
+    if (result.refusal) {
       return { status: 422, json: { matched: true, authorized: true, ...result } };
     }
     return { status: 200, json: { matched: true, authorized: true, ...result } };
@@ -217,6 +263,12 @@ function reapExpired() {
   let reaped = 0;
   for (const lease of state.listExpiredLeases(db, state.now())) {
     try {
+      // A stale lease must never remove a worktree that a newer active lease owns.
+      if (state.activeLeaseOwnsWorktree(db, { sourceRepo: lease.source_repo, worktree: lease.worktree }, lease.id)) {
+        state.releaseLease(db, lease.id);
+        log(`[router] not reaping ${lease.id}: worktree still owned by an active lease`);
+        continue;
+      }
       removeWorktreePath(lease.source_repo, lease.worktree);
       state.releaseLease(db, lease.id);
       log(`[router] reaped expired lease ${lease.id} (${lease.worktree})`);

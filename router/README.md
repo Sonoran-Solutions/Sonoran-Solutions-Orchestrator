@@ -36,9 +36,12 @@ router/
 | Authorization gate: trusted-actor allowlist and `agent:ready` label (labeler must be trusted) | ✅ |
 | SQLite `tasks`, `runs`, `deliveries`, `leases` (state survives restart) | ✅ |
 | Handoff envelope parser/validator (`schema_version: 1`, required fields, legal transitions) | ✅ |
-| Per-task git worktree + **named task branch** + lease + allowed-path / base-ref movement pre-push guard | ✅ (create/reap/guard) |
+| Per-task git worktree + **named task branch** + lease + allowed-path / base-ref movement pre-push guard | ✅ (create/reap/guard, fail-closed) |
+| Verified base SHA before worktree + refuse-on-unresolvable base SHA | ✅ |
+| Envelope/context cross-check (repo/issue/branch/allowed_paths/base_sha) + task-scope allowed paths | ✅ |
+| Exactly one active lease per task; stale lease never reaps an owned worktree | ✅ |
 | Worker env hygiene: allowlist-only environment (no router-secret leakage) | ✅ |
-| Tests: 20 passing (`node test.mjs`) | ✅ |
+| Tests: 27 passing (`node test.mjs`) | ✅ |
 
 A random public issue/PR **cannot** launch a worker: it needs a valid signature,
 an untrusted actor is rejected, a code-editing dispatch additionally needs a
@@ -69,6 +72,11 @@ Config is loaded from the first of:
 Secrets never live in config: the webhook secret is read from
 `$GITHUB_WEBHOOK_SECRET` (configurable via `githubSecretEnv`) and the Slack
 webhook from `$SLACK_WEBHOOK_URL` (`slackWebhookEnv`).
+
+`repoBase` (default `https://github.com`) is the base URL the router clones task
+repos from; point it at a local path in tests so the flow runs without network.
+`defaultBaseRef` (default `"main"`) is the branch a code task is based on when
+the event does not carry a PR base ref.
 
 ```bash
 cd router

@@ -136,8 +136,22 @@ export function createLease(db, lease) {
 }
 
 export function getActiveLeaseForTask(db, taskId) {
-  return db.prepare(`SELECT * FROM leases WHERE task_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1`)
+  return db.prepare(`SELECT * FROM leases WHERE task_id = ? AND status = 'active' ORDER BY rowid DESC LIMIT 1`)
     .get(taskId);
+}
+
+// Re-delivery must never leave two active leases for the same task/worktree:
+// release any existing active lease(s) for the task before a fresh one is made.
+export function releaseActiveLeasesForTask(db, taskId) {
+  db.prepare(`UPDATE leases SET status = 'released' WHERE task_id = ? AND status = 'active'`).run(taskId);
+}
+
+// Is there an ACTIVE lease (other than `excludeId`) that owns this worktree? The
+// stale-lease reaper uses this so it never removes a worktree another active
+// lease still owns.
+export function activeLeaseOwnsWorktree(db, { sourceRepo, worktree }, excludeId = null) {
+  return !!db.prepare(`SELECT 1 FROM leases WHERE status = 'active' AND source_repo = ? AND worktree = ? AND id != ?`)
+    .get(sourceRepo, worktree, excludeId ?? '');
 }
 
 export function releaseLease(db, id) {

@@ -12,6 +12,7 @@
   "stateDb": "state.sqlite",
   "reposRoot": "/home/dq/sonoran-checkouts",
   "worktreeRoot": "/home/dq/sonoran-worktrees",
+  "repoBase": "https://github.com",
   "defaultBaseRef": "main",
   "allowlist": ["Sonoran-Solutions"],
   "requireLabel": "agent:ready",

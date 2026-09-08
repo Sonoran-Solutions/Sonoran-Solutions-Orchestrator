@@ -1,10 +1,10 @@
 // router/test.mjs — Sonoran control-plane tests. Run: node test.mjs
-import { parseEnvelope, legalTransition } from './lib/handoff.mjs';
+import { parseEnvelope, legalTransition, validateEnvelopeContext, effectiveAllowedPaths, validBranchName } from './lib/handoff.mjs';
 import { authorize } from './lib/auth.mjs';
 import { normalize } from './lib/events.mjs';
 import { interpolateArgs, runWorker, buildWorkerEnv } from './lib/workers.mjs';
 import * as state from './lib/state.mjs';
-import { runGit, createWorktree, removeWorktree, installPushGuard, resolveGitDir, removeWorktreePath, safeBranchName } from './lib/worktrees.mjs';
+import { runGit, createWorktree, removeWorktree, installPushGuard, resolveGitDir, removeWorktreePath, safeBranchName, resolveBaseSha } from './lib/worktrees.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import http from 'node:http';
@@ -106,7 +106,37 @@ test('handoff: legal state transitions', () => {
   assert(legalTransition('planned', 'authorized'), 'planned->authorized');
   assert(legalTransition('review', 'in_progress'), 'review->in_progress (fix loop)');
   assert(!legalTransition('planned', 'in_progress'), 'planned->in_progress is not direct');
-  assert(!legalTransition('done', 'in_progress'), 'done->in_progress illegal');
+  assert(!legalTransition('done', 'in_progress'), 'done->in_progress illegal (no reopen yet)');
+});
+
+test('handoff: envelope is cross-checked against event context (repo/issue/branch/allowed_paths)', () => {
+  const ctx = { repo: 'Sonoran-Solutions/dualdex', issueNumber: 25 };
+  const okEnv = { repo: 'sonoran-solutions/dualdex', issue: '25', branch: 'feat/25', allowed_paths: ['app/src/**'] };
+  assert(validateEnvelopeContext(okEnv, ctx).ok, 'valid envelope passes repo/issue/branch');
+  // repo mismatch (case-insensitive compare should NOT reject for the valid one)
+  let r = validateEnvelopeContext({ ...okEnv, repo: 'evil/repo' }, ctx);
+  assert(!r.ok && r.errors.some((e) => e.includes('repo')), 'repo mismatch rejected');
+  r = validateEnvelopeContext({ ...okEnv, issue: '99' }, ctx);
+  assert(!r.ok && r.errors.some((e) => e.includes('issue')), 'issue mismatch rejected');
+  r = validateEnvelopeContext({ ...okEnv, branch: 'a b' }, ctx);
+  assert(!r.ok && r.errors.some((e) => e.includes('branch')), 'invalid branch rejected');
+  r = validateEnvelopeContext({ ...okEnv, branch: '-rf' }, ctx);
+  assert(!r.ok && r.errors.some((e) => e.includes('branch')), 'leading-dash branch rejected');
+  r = validateEnvelopeContext({ ...okEnv, allowed_paths: ['a', 3] }, ctx);
+  assert(!r.ok && r.errors.some((e) => e.includes('allowed_paths')), 'non-string allowed_path rejected');
+});
+
+test('handoff: effective allowed paths use the task scope, not the worker-global scope', () => {
+  const workerScope = ['app/src/**', 'native/**'];
+  // No task scope -> worker-global baseline.
+  assert(JSON.stringify(effectiveAllowedPaths({}, workerScope)) === JSON.stringify(workerScope), 'falls back to worker scope');
+  // Task scope present -> task scope binds (narrower), overrides the worker-global baseline.
+  const taskScope = ['tests/**'];
+  assert(JSON.stringify(effectiveAllowedPaths({ allowed_paths: taskScope }, workerScope)) === JSON.stringify(taskScope), 'task scope overrides worker scope');
+  // Empty/null task scope -> worker-global.
+  assert(JSON.stringify(effectiveAllowedPaths({ allowed_paths: [] }, workerScope)) === JSON.stringify(workerScope), 'empty task scope falls back');
+  assert(validBranchName('agent/task-1'), 'validBranchName accepts safe names');
+  assert(!validBranchName('x;cat /etc/passwd'), 'validBranchName rejects shell metachars');
 });
 
 // ---------------------------------------------------------------- auth
@@ -177,6 +207,32 @@ test('state: task creation is idempotent on re-delivery (retry, not a 500)', () 
   state.close(db); rmSync(dir, { recursive: true, force: true });
 });
 
+test('state: re-delivery releases old active leases, keeps exactly one active lease per task', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-lease-'));
+  const db = state.openDb(join(dir, 's.sqlite'));
+  state.createLease(db, { id: 'a', taskId: 'dualdex-25', worktree: '/wt', baseSha: 'abc', owner: 'codex', sourceRepo: '/src', expiresAt: '2099-01-01T00:00:00Z' });
+  state.createLease(db, { id: 'b', taskId: 'dualdex-25', worktree: '/wt', baseSha: 'def', owner: 'hermes', sourceRepo: '/src', expiresAt: '2099-01-01T00:00:01Z' });
+  assert(state.getActiveLeaseForTask(db, 'dualdex-25').id === 'b', 'newest active lease wins');
+  state.releaseActiveLeasesForTask(db, 'dualdex-25');
+  assert(state.getActiveLeaseForTask(db, 'dualdex-25') == null, 'no active lease remains for the task');
+  // A fresh lease can now be created without an existing active one for the task.
+  state.createLease(db, { id: 'c', taskId: 'dualdex-25', worktree: '/wt', baseSha: 'abc', owner: 'codex', sourceRepo: '/src', expiresAt: '2099-01-01T00:00:00Z' });
+  assert(state.getActiveLeaseForTask(db, 'dualdex-25').id === 'c', 'one active lease only');
+  state.close(db); rmSync(dir, { recursive: true, force: true });
+});
+
+test('state: a stale lease cannot reap a worktree owned by a newer active lease', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-own-'));
+  const db = state.openDb(join(dir, 's.sqlite'));
+  // Same worktree: one stale/expired lease and one active lease both reference it.
+  state.createLease(db, { id: 'stale', taskId: 'dualdex-25', worktree: '/wt', baseSha: 'abc', owner: 'codex', sourceRepo: '/src', expiresAt: new Date(Date.now() - 5000).toISOString() });
+  state.createLease(db, { id: 'active', taskId: 'dualdex-25', worktree: '/wt', baseSha: 'def', owner: 'hermes', sourceRepo: '/src', expiresAt: '2099-01-01T00:00:00Z' });
+  const expires = state.listExpiredLeases(db, state.now());
+  assert(expires.length === 1 && expires[0].id === 'stale', 'stale lease listed');
+  assert(state.activeLeaseOwnsWorktree(db, { sourceRepo: '/src', worktree: '/wt' }, 'stale'), 'an active lease still owns /wt');
+  state.close(db); rmSync(dir, { recursive: true, force: true });
+});
+
 // ---------------------------------------------------------------- worktrees
 test('worktrees: create + remove an isolated worktree on a named branch', () => {
   const dir = mkdtempSync(join(tmpdir(), 'sonoran-wt-'));
@@ -203,6 +259,36 @@ test('worktrees: safeBranchName rejects injection / invalid branch names', () =>
   assert(safeBranchName('a..b') === '', 'dotdot rejected');
   assert(safeBranchName('a;rm -rf /') === '', 'shell metachars rejected');
   assert(safeBranchName('/abs') === '', 'leading slash rejected');
+});
+
+test('worktrees: resolveBaseSha verifies a nonempty base SHA or returns null', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-base-'));
+  const { remoteDir, src, baseSha } = makeRemoteRepo(dir);
+  assert(/^[0-9a-f]{40}$/.test(baseSha), 'base canary SHA is full length');
+  // Resolve from a ref tip (issue task with no provided SHA).
+  assert(resolveBaseSha(src, 'main') === baseSha, 'resolves ref tip to the seeded base SHA');
+  // Resolve a provided SHA (PR task); short SHAs expand to full.
+  assert(resolveBaseSha(src, 'main', { providedSha: baseSha }) === baseSha, 'resolves provided full SHA');
+  assert(resolveBaseSha(src, 'main', { providedSha: baseSha.slice(0, 7) }) === baseSha, 'resolves provided short SHA');
+  // Unresolvable -> null (refuse to launch).
+  assert(resolveBaseSha(src, 'no-such-branch') === null, 'unknown ref -> null');
+  assert(resolveBaseSha(src, 'main', { providedSha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }) === null, 'nonexistent provided SHA -> null');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('worktrees: worktree branch setup fails closed, never silently detaches', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-fail-'));
+  const src = join(dir, 'repo'); const wtRoot = join(dir, 'worktrees');
+  mkdirSync(src); runGit(src, ['init', '-q']); runGit(src, ['config', 'user.email', 't@t']); runGit(src, ['config', 'user.name', 't']);
+  writeFileSync(join(src, 'f.txt'), 'hi'); runGit(src, ['add', 'f.txt']); runGit(src, ['commit', '-qm', 'init']);
+  const sha = runGit(src, ['rev-parse', 'HEAD']).trim();
+  // Pre-create the branch WITHOUT checking it out, so `-b` fails but attach succeeds.
+  runGit(src, ['branch', 'feat/existing']);
+  const wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha: sha, branch: 'feat/existing' });
+  assert(runGit(wt, ['rev-parse', '--abbrev-ref', 'HEAD']).trim() === 'feat/existing', 'attaches to the existing named branch, not detached');
+  assert(runGit(wt, ['rev-parse', 'HEAD']).trim() === sha, 'worktree HEAD is the base commit');
+  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1' });
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test('worktrees: push guard blocks base-branch movement + direct base push + scope (ORCH-081/082)', () => {
@@ -397,6 +483,95 @@ test('integration: full control-plane flow', async () => {
     const labelBody = JSON.stringify({ action: 'labeled', sender: { login: 'trusted-user' }, repository: { full_name: 'r/r' }, label: { name: 'agent:ready' }, issue: { number: 9, title: 'T', body: 'no envelope here', labels: [{ name: 'agent:ready' }] } });
     const r4 = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-label1', 'X-Hub-Signature-256': sign(SECRET, labelBody) }, body: labelBody });
     assert(r4.status === 422 && r4.body.reason === 'invalid handoff envelope', `envelope gate: ${JSON.stringify(r4.body)}`);
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise((r) => child.on('close', r));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('integration: valid issues:labeled code task resolves base SHA + creates named worktree (offline)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-int-code-'));
+  const port = 8241;
+  const SECRET = 'test-secret';
+  const repoSlug = 'Sonoran-Solutions/dualdex';
+  const remoteBase = join(dir, 'git-remote');
+  const bareRepo = join(remoteBase, repoSlug) + '.git';
+  // A temporary local bare repo stands in for GitHub, so the whole flow is offline.
+  mkdirSync(dirname(bareRepo), { recursive: true });
+  spawnSync('git', ['init', '--bare', '--quiet', bareRepo], { cwd: dir }).status === 0 || assert(false, 'bare repo init');
+  const seed = join(dir, 'seed');
+  mkdirSync(seed);
+  runGit(seed, ['init', '-q']);
+  runGit(seed, ['config', 'user.email', 't@t']);
+  runGit(seed, ['config', 'user.name', 't']);
+  runGit(seed, ['remote', 'add', 'origin', bareRepo]);
+  writeFileSync(join(seed, 'f.txt'), 'hello');
+  runGit(seed, ['add', 'f.txt']);
+  runGit(seed, ['commit', '-qm', 'init']);
+  runGit(seed, ['branch', '-M', 'main']);
+  runGit(seed, ['push', '-q', '-u', 'origin', 'main']);
+  spawnSync('git', ['symbolic-ref', 'HEAD', 'refs/heads/main'], { cwd: bareRepo }).status === 0 || assert(false, 'set bare HEAD');
+  const baseSha = runGit(seed, ['rev-parse', 'HEAD']).trim();
+  assert(/^[0-9a-f]{40}$/.test(baseSha), 'seeded base SHA is full length');
+
+  const cfg = {
+    port, devMode: false, bodyLimitBytes: 65536, defaultTimeoutMs: 20000, maxConcurrency: 2,
+    githubSecretEnv: 'GITHUB_WEBHOOK_SECRET', slackWebhookEnv: 'SLACK_WEBHOOK_URL',
+    stateDb: join(dir, 'state.sqlite'), reposRoot: join(dir, 'repos'), worktreeRoot: join(dir, 'worktrees'),
+    repoBase: remoteBase, defaultBaseRef: 'main', reapIntervalMs: 0, leaseDurationMs: 86400000,
+    allowlist: ['trusted-user'], requireLabel: 'agent:ready',
+    workers: {
+      codex: { program: 'node', args: ['-e', 'console.log("codex-ran")'], createsTask: true, allowedPaths: ['**'], envAllowlist: ['PATH', 'HOME'] },
+    },
+    rules: [
+      { id: 'codex-on-ready-label', when: { events: ['issues'], actions: ['labeled'] }, worker: 'codex', authorize: 'label' },
+    ],
+  };
+  writeFileSync(join(dir, 'config.json'), JSON.stringify(cfg));
+  const child = spawn('node', ['server.mjs'], {
+    cwd: routerDir,
+    env: { ...process.env, CONFIG_PATH: join(dir, 'config.json'), GITHUB_WEBHOOK_SECRET: SECRET, SLACK_WEBHOOK_URL: 'https://hooks.slack.com/services/REPLACE_WITH_REAL_TOKEN', DRY_RUN: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.stderr.on('data', () => {});
+  try {
+    await waitFor(() => httpRequest(port, { method: 'GET', path: '/health' }).then((r) => r.status === 200), 6000);
+
+    const envelope = `---
+schema_version: 1
+agent: hermes
+to: codex
+repo: sonoran-solutions/dualdex
+issue: "25"
+branch: feat/25
+base_sha: ${baseSha}
+state: in_progress
+task: Fix the thing
+acceptance: |
+  test passes
+---`;
+    const issueBody = JSON.stringify({
+      action: 'labeled',
+      sender: { login: 'trusted-user' },
+      repository: { full_name: repoSlug },
+      label: { name: 'agent:ready' },
+      issue: { number: 25, title: 'Fix the thing', body: envelope, labels: [{ name: 'agent:ready' }] },
+    });
+    const res = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-code-1', 'X-Hub-Signature-256': sign(SECRET, issueBody) }, body: issueBody });
+    assert(res.status === 200, `expected 200, got ${res.status}: ${JSON.stringify(res.body)}`);
+    assert(res.body.matched === true && res.body.ok === true, `code task dispatched: ${JSON.stringify(res.body)}`);
+    assert(res.body.taskId === 'dualdex-25', `task id present: ${res.body.taskId}`);
+    assert(res.body.worktree, 'worktree path returned');
+
+    const wt = res.body.worktree;
+    // Named task branch, NOT detached.
+    const br = runGit(wt, ['rev-parse', '--abbrev-ref', 'HEAD']).trim();
+    assert(br === 'feat/25', `named task branch created (got ${br})`);
+    // Worktree sits on the verified base SHA and the push guard records it.
+    assert(runGit(wt, ['rev-parse', 'HEAD']).trim() === baseSha, 'worktree HEAD is the verified base SHA');
+    assert(readFileSync(join(wt, '.sonoran-base-sha'), 'utf8').trim() === baseSha, 'push guard records the verified base SHA');
+    assert(readFileSync(join(wt, '.sonoran-base-ref'), 'utf8').trim() === 'main', 'push guard records the base ref');
   } finally {
     child.kill('SIGTERM');
     await new Promise((r) => child.on('close', r));

@@ -93,3 +93,49 @@ function validate(data, errors) {
 export function legalTransition(from, to) {
   return (VALID_TRANSITIONS[from] || []).includes(to);
 }
+
+// Conservative branch-name validator (kept in sync with lib/worktrees.mjs), so a
+// malicious envelope branch can never become argument injection for git.
+const BRANCH_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+export function validBranchName(name) {
+  if (!name) return false;
+  const s = String(name).trim();
+  if (!BRANCH_NAME_RE.test(s)) return false;
+  if (s.startsWith('-') || s.startsWith('/') || s.endsWith('/') || s.endsWith('.')) return false;
+  if (s.includes('..') || s.includes('//') || /\.lock$/i.test(s)) return false;
+  return true;
+}
+
+// Cross-check the parsed envelope against the normalized event context / router
+// state where applicable (repo, issue, branch, allowed_paths). base_sha is
+// cross-checked separately against the resolved base SHA in dispatch.
+export function validateEnvelopeContext(envelope, ctx) {
+  const errors = [];
+  if (!envelope) return { ok: false, errors: ['missing envelope'] };
+
+  if (ctx.repo && String(envelope.repo || '').toLowerCase() !== String(ctx.repo).toLowerCase()) {
+    errors.push(`envelope repo '${envelope.repo}' does not match event repo '${ctx.repo}'`);
+  }
+  const envIssue = envelope.issue != null && envelope.issue !== '' ? String(envelope.issue) : '';
+  if (ctx.issueNumber != null && envIssue && String(ctx.issueNumber) !== envIssue) {
+    errors.push(`envelope issue '${envelope.issue}' does not match event issue '${ctx.issueNumber}'`);
+  }
+  if (!validBranchName(envelope.branch)) {
+    errors.push(`envelope branch '${envelope.branch}' is not a valid branch name`);
+  }
+  if (envelope.allowed_paths !== undefined && envelope.allowed_paths !== null && envelope.allowed_paths !== '') {
+    if (!Array.isArray(envelope.allowed_paths) || !envelope.allowed_paths.every((p) => typeof p === 'string' && p.trim() !== '')) {
+      errors.push('envelope allowed_paths must be a list of non-empty path strings');
+    }
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+// Effective allowed paths for the push guard = the task scope (envelope
+// `allowed_paths`) when present, otherwise the worker-global scope. The task
+// scope binds, so a code task cannot widen to the worker-global baseline.
+export function effectiveAllowedPaths(envelope, workerAllowedPaths = []) {
+  const worker = Array.isArray(workerAllowedPaths) ? workerAllowedPaths.filter((p) => typeof p === 'string' && p.trim()) : [];
+  const env = Array.isArray(envelope?.allowed_paths) ? envelope.allowed_paths.filter((p) => typeof p === 'string' && p.trim()) : [];
+  return env.length ? env : worker;
+}
