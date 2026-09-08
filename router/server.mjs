@@ -16,7 +16,7 @@ import { normalize, templateVars } from './lib/events.mjs';
 import { parseEnvelope } from './lib/handoff.mjs';
 import { authorize } from './lib/auth.mjs';
 import * as state from './lib/state.mjs';
-import { resolveProgram, interpolateArgs, runWorker } from './lib/workers.mjs';
+import { resolveProgram, interpolateArgs, runWorker, buildWorkerEnv } from './lib/workers.mjs';
 import { ensureRepo, createWorktree, installPushGuard, removeWorktreePath } from './lib/worktrees.mjs';
 
 const cfg = loadConfig();
@@ -83,20 +83,24 @@ async function dispatch(rule, ctx) {
   let taskId = null; let worktree = null; let runId = null;
   if (isCodeWorker) {
     taskId = sanitizeTaskId(ctx.repo, ctx.issueNumber, ctx.headSha);
+    const baseRef = ctx.baseRef || cfg.defaultBaseRef || 'main';
+    const existedBefore = !!state.getTask(db, taskId);
     state.createTask(db, {
       id: taskId, repo: ctx.repo, issue: ctx.issueNumber != null ? String(ctx.issueNumber) : null,
       state: 'in_progress', owner: envelope.agent, branch: envelope.branch,
-      baseSha: ctx.baseSha || ctx.headSha, risk: 'pilot',
+      baseSha: ctx.baseSha || ctx.headSha, baseRef, risk: 'pilot',
     });
+    if (existedBefore) log(`[router] task ${taskId} already exists — deliberate retry/state transition`);
+    const attempt = state.nextAttempt(db, taskId);
     runId = crypto.randomUUID();
-    state.createRun(db, { id: runId, taskId, agent: rule.worker, attempt: 1, status: 'running' });
+    state.createRun(db, { id: runId, taskId, agent: rule.worker, attempt, status: 'running' });
 
     const sourceRepo = ensureRepo(ctx.repo, cfg.reposRoot);
     const baseSha = ctx.baseSha || ctx.headSha;
     worktree = createWorktree({
-      sourceRepo, worktreeRoot: cfg.worktreeRoot, taskId, baseSha,
+      sourceRepo, worktreeRoot: cfg.worktreeRoot, taskId, baseSha, branch: envelope.branch,
     });
-    installPushGuard(worktree, { allowedPaths: workerCfg.allowedPaths || [], baseSha });
+    installPushGuard(worktree, { allowedPaths: workerCfg.allowedPaths || [], baseSha, baseRef });
     state.createLease(db, {
       id: crypto.randomUUID(), taskId, worktree, baseSha, owner: envelope.agent,
       sourceRepo, expiresAt: new Date(Date.now() + (cfg.leaseDurationMs || 86400000)).toISOString(),
@@ -118,7 +122,9 @@ async function dispatch(rule, ctx) {
 
   const program = resolveProgram(workerCfg.program, cfg.__routerDir);
   const args = interpolateArgs(workerCfg.args || [], vars);
-  const env = { ...process.env, SONORAN_TASK_ID: taskId || '', SONORAN_WORKTREE: worktree || '' };
+  // Never inherit every env var from the router process (ORCH-094): workers get
+  // only an explicit allowlist (PATH/HOME by default) plus their task/worktree.
+  const env = buildWorkerEnv(workerCfg, { taskId, worktree });
 
   const result = await runWorker(workerCfg, {
     program, args, cwd: worktree || cfg.__routerDir, env, timeoutMs: workerCfg.timeoutMs || cfg.defaultTimeoutMs,

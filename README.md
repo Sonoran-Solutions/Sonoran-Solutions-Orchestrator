@@ -163,18 +163,20 @@ See [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) for the core implem
 
 ## Current prototype caveats
 
-The checked-in router and helper scripts are scaffolding. Before unattended use, the most important changes are:
+The control plane (HMAC, dedupe, authorization, SQLite state, safe `shell: false`
+dispatch, worktrees + named branches + lease, base-ref movement guard, worker
+env allowlist) is implemented and tested (`node test.mjs` → 20 passing). It is
+**not yet production-safe** for unattended use until these remain:
 
-- replace `shell: true` command interpolation;
-- parse/validate the handoff envelope instead of matching only generic webhook fields;
-- add correct issue/PR/task identifiers;
-- require signatures outside explicit local dev;
-- add authorization, SQLite state, dedupe, timeouts, concurrency, worktrees, and leases;
-- move Slack/secrets configuration outside agent-controlled worktrees;
-- make GitHub Actions the required-check authority;
-- configure GitHub Rulesets so required checks/review cannot be bypassed by normal agent credentials.
+- GitHub Actions as the required-check authority (M2.1 `ci.sh` contract);
+- GitHub Rulesets so required checks/review cannot be bypassed by normal agent
+  credentials (TOOL-021+);
+- Hermes repair wiring with minimum-environment leases (M2.2), plus the
+  deliberate-failure M2.3 tests;
 
-Do not expose the current router publicly or give it unattended code-editing authority until those items are complete.
+Also confirm ORCH-080 (verify lease ownership before push) before wide autonomous
+use. Do not expose the router publicly or give it unattended code-editing
+authority until the above are complete.
 
 ## Definition of success
 

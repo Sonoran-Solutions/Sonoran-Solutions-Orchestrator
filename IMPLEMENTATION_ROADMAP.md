@@ -216,13 +216,13 @@ This phase is intentionally before Hermes/autonomous handoffs.
 
 ## M1.5.7 — Worktree + lease isolation
 
-- [ ] **ORCH-077** Define the local worktree root outside the orchestrator source checkout.
-- [ ] **ORCH-078** Create one worktree per task/lease.
-- [ ] **ORCH-079** Record worktree path + base SHA + owner in SQLite.
-- [ ] **ORCH-080** Verify lease ownership before commit/push.
-- [ ] **ORCH-081** Stop/escalate if the branch moved unexpectedly.
-- [ ] **ORCH-082** Enforce `allowed_paths` before commit/push.
-- [ ] **ORCH-083** Clean/reap expired worktrees safely.
+- [x] **ORCH-077** Define the local worktree root outside the orchestrator source checkout. (`worktreeRoot` config)
+- [x] **ORCH-078** Create one worktree per task/lease.
+- [x] **ORCH-079** Record worktree path + base SHA + owner in SQLite. (`leases` table)
+- [ ] **ORCH-080** Verify lease ownership before commit/push. (still open: the pre-push guard does not yet confirm the pusher holds the active lease)
+- [x] **ORCH-081** Stop/escalate if the branch moved unexpectedly. (pre-push guard compares the live remote base tip against the recorded base SHA, independent of the pushed ref)
+- [x] **ORCH-082** Enforce `allowed_paths` before commit/push.
+- [x] **ORCH-083** Clean/reap expired worktrees safely. (periodic `reapExpired()` in `server.mjs`)
 
 ### M1.5 exit criteria
 

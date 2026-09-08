@@ -9,7 +9,18 @@ export function openDb(path) {
   const db = new DatabaseSync(path);
   db.exec('PRAGMA journal_mode = WAL;');
   init(db);
+  // Lightweight migration for DBs created before base_ref was tracked.
+  ensureColumn(db, 'tasks', 'base_ref', 'base_ref TEXT');
   return db;
+}
+
+// Add a column only if it is missing (CREATE TABLE IF NOT EXISTS does not alter
+// an existing table, so we guard upgrades for older state.sqlite files).
+function ensureColumn(db, table, column, ddl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  }
 }
 
 function init(db) {
@@ -29,6 +40,7 @@ function init(db) {
       owner      TEXT,
       branch     TEXT,
       base_sha   TEXT,
+      base_ref   TEXT,
       risk       TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -67,12 +79,25 @@ export function recordDelivery(db, { id, repo, event, actor }) {
   return r.changes === 1;
 }
 
+// Idempotent task creation (ORCH-057 + retry hardening): a task ID is
+// repo-name + issue-number, so the same label being removed and re-added (a new
+// GitHub delivery, same task ID) must be a deliberate state transition/retry,
+// never an INSERT collision that turns into a 500.
 export function createTask(db, task) {
   const t = now();
-  db.prepare(`INSERT INTO tasks (id, repo, issue, state, owner, branch, base_sha, risk, created_at, updated_at)
-              VALUES (?,?,?,?,?,?,?,?,?,?)`)
+  const existing = getTask(db, task.id);
+  if (existing) {
+    db.prepare(`UPDATE tasks SET repo=?, issue=?, state=?, owner=?, branch=?, base_sha=?, base_ref=?, risk=?, updated_at=?
+                WHERE id=?`)
+      .run(task.repo, task.issue ?? null, task.state ?? existing.state, task.owner ?? existing.owner,
+           task.branch ?? existing.branch, task.baseSha ?? existing.base_sha, task.baseRef ?? existing.base_ref,
+           task.risk ?? existing.risk, t, task.id);
+    return getTask(db, task.id);
+  }
+  db.prepare(`INSERT INTO tasks (id, repo, issue, state, owner, branch, base_sha, base_ref, risk, created_at, updated_at)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
     .run(task.id, task.repo, task.issue ?? null, task.state || 'planned', task.owner ?? null,
-         task.branch ?? null, task.baseSha ?? null, task.risk ?? null, t, t);
+         task.branch ?? null, task.baseSha ?? null, task.baseRef ?? null, task.risk ?? null, t, t);
   return getTask(db, task.id);
 }
 
@@ -90,6 +115,12 @@ export function createRun(db, run) {
               VALUES (?,?,?,?,?,?)`)
     .run(run.id, run.taskId, run.agent, run.attempt ?? 1, run.status || 'running', now());
   return run.id;
+}
+
+// next attempt number for a task (1-based): the highest previous attempt + 1.
+export function nextAttempt(db, taskId) {
+  const r = db.prepare('SELECT COALESCE(MAX(attempt), 0) AS m FROM runs WHERE task_id = ?').get(taskId);
+  return ((r && r.m) || 0) + 1;
 }
 
 export function updateRun(db, id, { status, result }) {

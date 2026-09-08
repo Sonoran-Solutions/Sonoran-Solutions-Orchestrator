@@ -21,6 +21,7 @@ export function normalize(headers, body) {
     branch: String(ref).replace(/^refs\/heads\//, ''),
     headSha: String(body.after || pr?.head?.sha || ''),
     baseSha: String(body.before || pr?.base?.sha || ''),
+    baseRef: String(pr?.base?.ref || ''),
     labels,
     ref,
     title: String(pr?.title || issue?.title || ''),

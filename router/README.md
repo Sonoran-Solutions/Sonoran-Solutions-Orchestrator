@@ -24,11 +24,11 @@ router/
   test.mjs              test suite (node test.mjs)
 ```
 
-## What is implemented (ORCH-050…083)
+## What is implemented (ORCH-050…083 + ORCH-094 groundwork)
 
 | Area | Status |
 |---|---|
-| Normalized event context (delivery id, event/action, repo, issue/PR, actor, branch, head/base SHA, labels) | ✅ |
+| Normalized event context (delivery id, event/action, repo, issue/PR, actor, branch, head/base SHA, base ref, labels) | ✅ |
 | Request-body size limit, worker timeout, concurrency limit, graceful shutdown | ✅ |
 | Mandatory HMAC signature verification (rejects missing/invalid; `devMode` is the only opt-out) | ✅ |
 | GitHub delivery-id dedupe (idempotent) | ✅ |
@@ -36,8 +36,9 @@ router/
 | Authorization gate: trusted-actor allowlist and `agent:ready` label (labeler must be trusted) | ✅ |
 | SQLite `tasks`, `runs`, `deliveries`, `leases` (state survives restart) | ✅ |
 | Handoff envelope parser/validator (`schema_version: 1`, required fields, legal transitions) | ✅ |
-| Per-task git worktree + lease + allowed-path pre-push guard | ✅ (create/reap/guard) |
-| Tests: 15 passing (`node test.mjs`) | ✅ |
+| Per-task git worktree + **named task branch** + lease + allowed-path / base-ref movement pre-push guard | ✅ (create/reap/guard) |
+| Worker env hygiene: allowlist-only environment (no router-secret leakage) | ✅ |
+| Tests: 20 passing (`node test.mjs`) | ✅ |
 
 A random public issue/PR **cannot** launch a worker: it needs a valid signature,
 an untrusted actor is rejected, a code-editing dispatch additionally needs a
@@ -45,17 +46,16 @@ valid handoff envelope, and the `agent:ready` path requires a trusted labeler.
 
 ## Not yet implemented (do not rely on these)
 
-- **Base-SHA movement check at push time** (ORCH-081): the router records
-  `base_sha`, but the "stop if the branch moved unexpectedly" check is not wired
-  into a pre-push gate yet. GitHub Rulesets (TOOL-021+) are the intended
-  independent backstop.
-- **Automatic stale-lease reaping** (ORCH-083): `listExpiredLeases` exists, but
-  there is no periodic reaper; expired worktrees must be removed manually or via
-  a cron for now.
-- **Body-limit / concurrency / timeout paths** are implemented but not yet
-  covered by an automated test.
 - **GitHub Actions as the required-check authority** and **Hermes repair** are
   M2 (see the roadmap) — not part of this control-plane milestone.
+- **M2.1 CI contract** (`ci.sh`) and **M2.2 Hermes install** remain open.
+- **Body-limit / concurrency / timeout paths** are implemented but exercised only
+  indirectly by the HTTP integration test.
+
+Note on ORCH-081/083: both **are wired**. The pre-push guard records the task's
+base ref and blocks a push when the live remote base tip moved from the recorded
+base SHA, and `server.mjs` reaps expired leases on `reapIntervalMs`. The intended
+independent backstop remains GitHub Rulesets (TOOL-021+).
 
 ## Configuration
 
@@ -81,9 +81,11 @@ GITHUB_WEBHOOK_SECRET=... SLACK_WEBHOOK_URL=... node server.mjs
 ```jsonc
 "workers": {
   "codex": { "program": "codex", "args": ["exec", "--full-auto", "{{prompt}}"],
-             "createsTask": true, "allowedPaths": ["app/src/**"] },
+             "createsTask": true, "allowedPaths": ["app/src/**"],
+             "envAllowlist": ["PATH", "HOME"] },
   "notify": { "program": "../slack-notify/slack-notify.sh",
-              "args": ["pr-ready", "{{task}}", "--link", "{{link}}"] }
+              "args": ["pr-ready", "{{task}}", "--link", "{{link}}"],
+              "envAllowlist": ["PATH", "HOME", "SLACK_WEBHOOK_URL"] }
 }
 ```
 
@@ -92,6 +94,16 @@ Interpolation uses only the normalized context (`{{repo}}`, `{{branch}}`,
 `{{task}}`, `{{link}}`, `{{prompt}}`, `{{worktree}}`…), never raw body text.
 `createsTask: true` marks a worker as code-editing: it requires a valid handoff
 envelope and gets an isolated worktree + lease.
+
+`envAllowlist` is the **only** environment a worker sees. Default when omitted is
+`["PATH", "HOME"]`. The router never passes its own secrets to a worker, so the
+GitHub webhook secret (`GITHUB_WEBHOOK_SECRET`) and the Slack webhook URL are
+only available to a worker that explicitly declares them (e.g. the `notify`
+worker declares `SLACK_WEBHOOK_URL`). Code-editing workers must not declare the
+webhook secret. `SONORAN_TASK_ID` and `SONORAN_WORKTREE` are always added.
+
+`defaultBaseRef` (default `"main"`) names which branch a task is based on,
+falling back to the PR base ref when the event carries one.
 
 ### Rules
 
@@ -128,6 +140,8 @@ node test.mjs
 
 Covers handoff parsing/validation (valid, missing, unknown schema, malicious,
 lists/block-scalars, state transitions), authorization, event normalization,
-SQLite dedupe/round-trip, worktree create/reap, shell-injection safety, and a
-full HTTP integration flow (HMAC 401, untrusted 403, notify dispatch, dedupe,
-and the invalid-envelope 422 gate).
+SQLite dedupe/round-trip/idempotent task re-delivery, worktree create/reap and
+named-branch + safe-branch-name validation, base-ref movement + scope push-guard,
+shell-injection safety, worker env allowlist filtering, and a full HTTP
+integration flow (HMAC 401, untrusted 403, notify dispatch, dedupe, and the
+invalid-envelope 422 gate).

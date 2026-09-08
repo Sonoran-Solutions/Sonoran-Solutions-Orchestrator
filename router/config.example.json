@@ -12,18 +12,21 @@
   "stateDb": "state.sqlite",
   "reposRoot": "/home/dq/sonoran-checkouts",
   "worktreeRoot": "/home/dq/sonoran-worktrees",
-  "allowlist": ["devils-17"],
+  "defaultBaseRef": "main",
+  "allowlist": ["Sonoran-Solutions"],
   "requireLabel": "agent:ready",
   "workers": {
     "notify": {
       "program": "../slack-notify/slack-notify.sh",
-      "args": ["pr-ready", "{{task}}", "--link", "{{link}}"]
+      "args": ["pr-ready", "{{task}}", "--link", "{{link}}"],
+      "envAllowlist": ["PATH", "HOME", "SLACK_WEBHOOK_URL"]
     },
     "codex": {
       "program": "codex",
       "args": ["exec", "--full-auto", "{{prompt}}"],
       "createsTask": true,
-      "allowedPaths": ["app/src/**", "native/**", "*.md"]
+      "allowedPaths": ["app/src/**", "native/**", "*.md"],
+      "envAllowlist": ["PATH", "HOME"]
     }
   },
   "rules": [

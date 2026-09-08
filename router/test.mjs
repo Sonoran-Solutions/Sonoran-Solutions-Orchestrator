@@ -2,9 +2,9 @@
 import { parseEnvelope, legalTransition } from './lib/handoff.mjs';
 import { authorize } from './lib/auth.mjs';
 import { normalize } from './lib/events.mjs';
-import { interpolateArgs, runWorker } from './lib/workers.mjs';
+import { interpolateArgs, runWorker, buildWorkerEnv } from './lib/workers.mjs';
 import * as state from './lib/state.mjs';
-import { runGit, createWorktree, removeWorktree, installPushGuard, resolveGitDir, removeWorktreePath } from './lib/worktrees.mjs';
+import { runGit, createWorktree, removeWorktree, installPushGuard, resolveGitDir, removeWorktreePath, safeBranchName } from './lib/worktrees.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import http from 'node:http';
@@ -18,6 +18,30 @@ let passed = 0; let failed = 0;
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 function assert(cond, msg) { if (!cond) throw new Error(msg || 'assertion failed'); }
+
+// git util that throws on non-zero exit, for expected-success assertions.
+function git(cwd, args) { return runGit(cwd, args); }
+// Build an isolated source repo with a real origin remote pointing at a bare repo,
+// so pre-push guards can query `git ls-remote origin` for the live base tip.
+function makeRemoteRepo(dir) {
+  const remoteDir = join(dir, 'remote.git');
+  const src = join(dir, 'repo');
+  spawnSync('git', ['init', '--bare', '--quiet', remoteDir], { cwd: dir }).status === 0 || assert(false, 'bare init');
+  mkdirSync(src);
+  git(src, ['init', '-q']);
+  git(src, ['config', 'user.email', 't@t']);
+  git(src, ['config', 'user.name', 't']);
+  git(src, ['remote', 'add', 'origin', remoteDir]);
+  writeFileSync(join(src, 'f.txt'), 'hello');
+  git(src, ['add', 'f.txt']);
+  git(src, ['commit', '-qm', 'init']);
+  git(src, ['branch', '-M', 'main']);
+  git(src, ['push', '-q', '-u', 'origin', 'main']);
+  spawnSync('git', ['symbolic-ref', 'HEAD', 'refs/heads/main'], { cwd: remoteDir }).status === 0 || assert(false, 'set bare HEAD');
+  const baseSha = git(src, ['rev-parse', 'HEAD']).trim();
+  return { remoteDir, src, baseSha };
+}
+const ZERO = '0000000000000000000000000000000000000000';
 
 // ---------------------------------------------------------------- handoff
 const ENVELOPE = `---\nschema_version: 1\nagent: codex\nto: antigravity\nrepo: Sonoran-Solutions/dualdex\nissue: "123"\nbranch: feat/123\nstate: planned\ntask: Add profile\nsummary: |\n  Do the thing\n  with more detail\nacceptance: |\n  test passes\nurgency: normal\nescalate_to: human\n---\nrest is prose`;
@@ -133,44 +157,102 @@ test('state: task/run/lease round-trip', () => {
   state.close(db); rmSync(dir, { recursive: true, force: true });
 });
 
+test('state: task creation is idempotent on re-delivery (retry, not a 500)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-state-'));
+  const db = state.openDb(join(dir, 's.sqlite'));
+  const task = { id: 'dualdex-25', repo: 'Sonoran-Solutions/dualdex', issue: '25', state: 'in_progress', owner: 'codex', branch: 'feat/25', baseSha: 'abc', baseRef: 'main', risk: 'pilot' };
+  const first = state.createTask(db, task);
+  assert(first.state === 'in_progress', 'first create inserts');
+  // New delivery, same task ID (label removed + re-added) -> deliberate transition, no throw
+  const second = state.createTask(db, { id: 'dualdex-25', repo: 'Sonoran-Solutions/dualdex', issue: '25', state: 'in_progress', owner: 'hermes', branch: 'feat/25', baseSha: 'def', baseRef: 'main' });
+  assert(second.id === 'dualdex-25', 'same id returned');
+  assert(second.owner === 'hermes', 'owner transitioned on retry');
+  assert(second.base_sha === 'def', 'base ref-sha transitioned on retry');
+  assert(state.getTask(db, 'dualdex-25').repo === 'Sonoran-Solutions/dualdex', 'task still present');
+  // attempts increment across runs
+  state.createRun(db, { id: 'r1', taskId: 'dualdex-25', agent: 'codex', attempt: 1 });
+  assert(state.nextAttempt(db, 'dualdex-25') === 2, 'next attempt after one run');
+  state.createRun(db, { id: 'r2', taskId: 'dualdex-25', agent: 'hermes', attempt: state.nextAttempt(db, 'dualdex-25') });
+  assert(state.nextAttempt(db, 'dualdex-25') === 3, 'next attempt after two runs');
+  state.close(db); rmSync(dir, { recursive: true, force: true });
+});
+
 // ---------------------------------------------------------------- worktrees
-test('worktrees: create + remove an isolated worktree', () => {
+test('worktrees: create + remove an isolated worktree on a named branch', () => {
   const dir = mkdtempSync(join(tmpdir(), 'sonoran-wt-'));
   const src = join(dir, 'repo'); const wtRoot = join(dir, 'worktrees');
   mkdirSync(src); runGit(src, ['init', '-q']); runGit(src, ['config', 'user.email', 't@t']); runGit(src, ['config', 'user.name', 't']);
   writeFileSync(join(src, 'f.txt'), 'hello'); runGit(src, ['add', 'f.txt']); runGit(src, ['commit', '-qm', 'init']);
   const sha = runGit(src, ['rev-parse', 'HEAD']).trim();
-  const wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'task-1', baseSha: sha });
+  const wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'task-1', baseSha: sha, branch: 'feat/1' });
   assert(wt.endsWith('task-1'), 'worktree path');
   assert(runGit(src, ['worktree', 'list']).includes('task-1'), 'worktree listed');
+  const br = runGit(wt, ['rev-parse', '--abbrev-ref', 'HEAD']).trim();
+  assert(br === 'feat/1', `named task branch created (got ${br})`);
   removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'task-1' });
   assert(!runGit(src, ['worktree', 'list']).includes('task-1'), 'worktree removed');
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('worktrees: push guard enforces base-SHA + scope files (ORCH-081/082)', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'sonoran-guard-'));
-  const src = join(dir, 'repo'); const wtRoot = join(dir, 'worktrees');
-  mkdirSync(src); runGit(src, ['init', '-q']); runGit(src, ['config', 'user.email', 't@t']); runGit(src, ['config', 'user.name', 't']);
-  writeFileSync(join(src, 'f.txt'), 'hi'); runGit(src, ['add', 'f.txt']); runGit(src, ['commit', '-qm', 'init']);
-  const sha = runGit(src, ['rev-parse', 'HEAD']).trim();
-  const wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha: sha });
+test('worktrees: safeBranchName rejects injection / invalid branch names', () => {
+  assert(safeBranchName('feat/123') === 'feat/123', 'normal branch ok');
+  assert(safeBranchName('agent/task-1') === 'agent/task-1', 'agent branch ok');
+  assert(safeBranchName('') === '', 'empty -> empty');
+  assert(safeBranchName('-rf') === '', 'leading dash rejected');
+  assert(safeBranchName('a b') === '', 'space rejected');
+  assert(safeBranchName('a..b') === '', 'dotdot rejected');
+  assert(safeBranchName('a;rm -rf /') === '', 'shell metachars rejected');
+  assert(safeBranchName('/abs') === '', 'leading slash rejected');
+});
 
-  const baseSha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
-  installPushGuard(wt, { allowedPaths: ['*'], baseSha });
+test('worktrees: push guard blocks base-branch movement + direct base push + scope (ORCH-081/082)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-guard-'));
+  const { remoteDir, src, baseSha } = makeRemoteRepo(dir);
+  const wtRoot = join(dir, 'worktrees');
+  const wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha, branch: 'feat/1' });
+  installPushGuard(wt, { allowedPaths: ['*'], baseSha, baseRef: 'main' });
   assert(readFileSync(join(wt, '.sonoran-base-sha'), 'utf8').trim() === baseSha, 'base-sha file written');
+  assert(readFileSync(join(wt, '.sonoran-base-ref'), 'utf8').trim() === 'main', 'base-ref file written');
 
   const hook = join(resolveGitDir(wt), 'hooks', 'pre-push');
-  const zero = '0000000000000000000000000000000000000000';
-  const moved = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  const localSha = runGit(wt, ['rev-parse', 'HEAD']).trim();
+  const assertStderr = (r, needle) => assert(String(r.stderr).includes(needle), `expected "${needle}" in ${JSON.stringify(String(r.stderr))}`);
 
-  let r = spawnSync('sh', [hook], { cwd: wt, input: `refs/heads/x ${sha} refs/heads/x ${zero}\n` });
-  assert(r.status === 0, 'new branch (all-zero remote) allowed');
-  r = spawnSync('sh', [hook], { cwd: wt, input: `refs/heads/x ${sha} refs/heads/x ${baseSha}\n` });
-  assert(r.status === 0, 'unchanged base allowed');
-  r = spawnSync('sh', [hook], { cwd: wt, input: `refs/heads/x ${sha} refs/heads/x ${moved}\n` });
-  assert(r.status !== 0, 'moved base blocked');
-  assert(String(r.stderr).includes('branch moved'), 'block message mentions base movement');
+  // 1. New feature branch push with the base UNCHANGED -> allowed
+  let r = spawnSync('sh', [hook], { cwd: wt, input: `refs/heads/feat/1 ${localSha} refs/heads/feat/1 ${ZERO}\n` });
+  assert(r.status === 0, 'new branch allowed when base unchanged');
+
+  // 2. Pushing directly to the base branch -> blocked (worker must stay off base)
+  r = spawnSync('sh', [hook], { cwd: wt, input: `refs/heads/main ${localSha} refs/heads/main ${baseSha}\n` });
+  assert(r.status !== 0, 'direct push to base branch blocked');
+  assertStderr(r, 'cannot push directly to the base branch');
+
+  // 3. Allow-paths gate: an out-of-scope file is blocked (while the base is unchanged)
+  writeFileSync(join(wt, 'outside.txt'), 'x');
+  runGit(wt, ['add', 'outside.txt']);
+  runGit(wt, ['commit', '-qm', 'outside change']);
+  const localSha2 = runGit(wt, ['rev-parse', 'HEAD']).trim();
+  installPushGuard(wt, { allowedPaths: ['app/src/**'], baseSha, baseRef: 'main' });
+  r = spawnSync('sh', [hook], { cwd: wt, input: `refs/heads/feat/1 ${localSha2} refs/heads/feat/1 ${ZERO}\n` });
+  assert(r.status !== 0, 'out-of-scope file blocked');
+  assertStderr(r, "outside this task's allowed paths");
+
+  // 4. Move main on the remote (simulating the base moving unexpectedly)
+  const peer = join(dir, 'peer');
+  spawnSync('git', ['clone', '-q', '-b', 'main', remoteDir, peer], { cwd: dir }).status === 0 || assert(false, 'peer clone');
+  git(peer, ['config', 'user.email', 't@t']);
+  git(peer, ['config', 'user.name', 't']);
+  writeFileSync(join(peer, 'g.txt'), 'x');
+  git(peer, ['add', 'g.txt']);
+  git(peer, ['commit', '-qm', 'move base']);
+  git(peer, ['push', '-q', 'origin', 'main']);
+  const newBase = git(src, ['ls-remote', 'origin', 'refs/heads/main']).split('\t')[0].trim();
+  assert(newBase !== baseSha, 'remote main advanced past recorded base');
+
+  // 5. Now a NEW feature branch push is blocked because the base moved
+  r = spawnSync('sh', [hook], { cwd: wt, input: `refs/heads/feat/2 ${localSha2} refs/heads/feat/2 ${ZERO}\n` });
+  assert(r.status !== 0, 'new branch blocked after base moved');
+  assertStderr(r, 'base branch moved unexpectedly');
 
   removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1' });
   rmSync(dir, { recursive: true, force: true });
@@ -212,6 +294,27 @@ test('workers: malicious strings stay literal argv (no shell)', async () => {
   assert(!existsSync('/tmp/sonoran-pwned'), 'no side effect from shell injection');
 });
 
+// ---------------------------------------------------------------- env hygiene (ORCH-094/096)
+test('workers: env is allowlist-filtered, never inherited from the router (ORCH-094)', () => {
+  const env = {
+    PATH: '/usr/bin', HOME: '/home/dq', LANG: 'C',
+    GITHUB_WEBHOOK_SECRET: 'super-secret', SLACK_WEBHOOK_URL: 'https://hooks.slack.com/secret',
+  };
+  const out = buildWorkerEnv({ envAllowlist: ['PATH', 'HOME'] }, { taskId: 'dualdex-25', worktree: '/wt', env });
+  assert(out.PATH === '/usr/bin' && out.HOME === '/home/dq', 'allowlisted vars passed');
+  assert(out.SONORAN_TASK_ID === 'dualdex-25' && out.SONORAN_WORKTREE === '/wt', 'sonoran task/worktree injected');
+  assert(!('GITHUB_WEBHOOK_SECRET' in out), 'webhook secret never inherited');
+  assert(!('SLACK_WEBHOOK_URL' in out) && !('LANG' in out), 'unlisted/secret vars never inherited');
+  // Default allowlist when a worker does not declare one: PATH + HOME only.
+  const def = buildWorkerEnv({}, { taskId: 't', env });
+  assert(def.PATH === '/usr/bin' && def.HOME === '/home/dq', 'default allowlist is PATH+HOME');
+  assert(!('GITHUB_WEBHOOK_SECRET' in def) && !('SLACK_WEBHOOK_URL' in def), 'default excludes router secrets');
+  // A worker may opt into a specific credential it genuinely needs (e.g. the notifier).
+  const notifier = buildWorkerEnv({ envAllowlist: ['PATH', 'HOME', 'SLACK_WEBHOOK_URL'] }, { taskId: '', worktree: '', env });
+  assert(notifier.SLACK_WEBHOOK_URL === 'https://hooks.slack.com/secret', 'explicit worker credential allowed');
+  assert(!('GITHUB_WEBHOOK_SECRET' in notifier), 'webhook secret still never allowed');
+});
+
 // ---------------------------------------------------------------- integration (HTTP)
 async function httpRequest(port, { method = 'POST', path = '/', headers = {}, body } = {}) {
   return new Promise((resolve, reject) => {
@@ -241,10 +344,11 @@ test('integration: full control-plane flow', async () => {
     port, devMode: false, bodyLimitBytes: 65536, defaultTimeoutMs: 20000, maxConcurrency: 2,
     githubSecretEnv: 'GITHUB_WEBHOOK_SECRET', slackWebhookEnv: 'SLACK_WEBHOOK_URL',
     stateDb: join(dir, 'state.sqlite'), reposRoot: join(dir, 'repos'), worktreeRoot: join(dir, 'worktrees'),
+    defaultBaseRef: 'main',
     allowlist: ['trusted-user'], requireLabel: 'agent:ready',
     workers: {
-      notify: { program: '../slack-notify/slack-notify.sh', args: ['pr-ready', '{{task}}', '--link', '{{link}}'] },
-      codex: { program: 'node', args: ['-e', 'console.log("codex-ran")'], createsTask: true, allowedPaths: ['*'] },
+      notify: { program: '../slack-notify/slack-notify.sh', args: ['pr-ready', '{{task}}', '--link', '{{link}}'], envAllowlist: ['PATH', 'HOME', 'DRY_RUN'] },
+      codex: { program: 'node', args: ['-e', 'console.log("codex-ran")'], createsTask: true, allowedPaths: ['*'], envAllowlist: ['PATH', 'HOME'] },
     },
     rules: [
       { id: 'pr-opened-notify', when: { events: ['pull_request'], actions: ['opened'] }, worker: 'notify', authorize: 'trusted' },
