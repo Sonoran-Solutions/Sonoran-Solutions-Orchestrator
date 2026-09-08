@@ -18,7 +18,7 @@ import { parseEnvelope, validateEnvelopeContext, pathScopes, validateNewTaskStat
 import { authorize } from './lib/auth.mjs';
 import * as state from './lib/state.mjs';
 import { resolveProgram, interpolateArgs, runWorker, buildWorkerEnv } from './lib/workers.mjs';
-import { DEFAULT_MAX_REPAIR_ATTEMPTS, DEFAULT_REPAIR_BUILD_CMD, readRepairResult, classifyRepairResult, attemptExceeded } from './lib/hermes.mjs';
+import { DEFAULT_MAX_REPAIR_ATTEMPTS, DEFAULT_REPAIR_BUILD_CMD, readRepairResult, classifyRepairResult, buildRepairRecord, attemptExceeded } from './lib/hermes.mjs';
 import { ensureRepo, prepareWorktreeForRun, installPushGuard, removeWorktreePath, resolveBaseSha, resolveCommitSha } from './lib/worktrees.mjs';
 
 const cfg = loadConfig();
@@ -120,7 +120,7 @@ async function dispatch(rule, ctx) {
   //   -> install path/base guard -> create one active lease -> create one running
   //   run -> launch worker (outside the lock).
   let taskId = null; let worktree = null; let runId = null;
-  let attempt = null; let leaseId = null; let baseSha = null;
+  let attempt = null; let repairAttempt = null; let leaseId = null; let baseSha = null;
   let workerAllowedPaths = []; let taskAllowedPaths = [];
   if (isCodeWorker) {
     taskId = sanitizeTaskId(ctx.repo, ctx.issueNumber, ctx.headSha);
@@ -189,7 +189,9 @@ async function dispatch(rule, ctx) {
         if (existing && (existing.state === 'escalated' || existing.state === 'blocked')) {
           return refusal(`task is '${existing.state}' — autonomous repair requires human re-authorization`);
         }
-        if (attemptExceeded(state.nextAttempt(db, taskId), maxAttempts)) {
+        // The repair budget counts REPAIR attempts only (ORCH-098). Unrelated
+        // planning/implementation runs on the same task must not consume it.
+        if (attemptExceeded(state.nextRepairAttempt(db, taskId), maxAttempts)) {
           state.updateTaskState(db, taskId, 'escalated');
           return refusal(`repair attempt limit reached (max ${maxAttempts}); task escalated to human`);
         }
@@ -214,14 +216,15 @@ async function dispatch(rule, ctx) {
         const wt = prepared.path;
         installPushGuard(wt, { workerAllowedPaths, taskAllowedPaths, baseSha, baseRef });
         const attempt = state.nextAttempt(db, taskId);
+        const repairAttemptN = workerCfg.repair ? state.nextRepairAttempt(db, taskId) : null;
         const rid = crypto.randomUUID();
         const lid = crypto.randomUUID();
         state.createLease(db, {
           id: lid, taskId, worktree: wt, baseSha, owner: envelope.agent,
           sourceRepo, expiresAt: new Date(Date.now() + (cfg.leaseDurationMs || 86400000)).toISOString(),
         });
-        state.createRun(db, { id: rid, taskId, agent: rule.worker, attempt, status: 'running' });
-        return { ok: true, worktree: wt, runId: rid, attempt, leaseId: lid, baseSha };
+        state.createRun(db, { id: rid, taskId, agent: rule.worker, attempt, repairAttempt: repairAttemptN, status: 'running' });
+        return { ok: true, worktree: wt, runId: rid, attempt, repairAttempt: repairAttemptN, leaseId: lid, baseSha };
       } catch (e) {
         log(`[router] worktree setup failed for ${taskId}: ${e.message}`);
         state.updateTaskState(db, taskId, 'blocked');
@@ -233,6 +236,7 @@ async function dispatch(rule, ctx) {
     worktree = reservation.worktree;
     runId = reservation.runId;
     attempt = reservation.attempt ?? null;
+    repairAttempt = reservation.repairAttempt ?? null;
     leaseId = reservation.leaseId ?? null;
     baseSha = reservation.baseSha ?? null;
   }
@@ -263,7 +267,7 @@ async function dispatch(rule, ctx) {
       REPO: ctx.repo,
       BRANCH: envelope?.branch || ctx.branch || '',
       BASE_SHA: baseSha,
-      ATTEMPT: attempt,
+      ATTEMPT: repairAttempt,
       MAX_ATTEMPTS: maxAttempts,
       ALLOWED_PATHS: workerAllowedPaths.join('\n'),
       TASK_PATHS: taskAllowedPaths.join('\n'),
@@ -285,10 +289,13 @@ async function dispatch(rule, ctx) {
   });
 
   // Interpret the repair worker's structured result. The router — never the
-  // worker's prose — decides whether the autonomous repair loop continues.
+  // worker's prose — decides whether the autonomous repair loop continues, and
+  // durably persists the validated structured evidence (ORCH-099 / blocker 4).
+  let repairRead = null;
   let repairAction = null;
   if (workerCfg.repair) {
-    repairAction = classifyRepairResult(readRepairResult(repairResultFile));
+    repairRead = readRepairResult(repairResultFile, { expectedAttempt: repairAttempt });
+    repairAction = classifyRepairResult(repairRead);
   }
 
   if (runId) {
@@ -298,7 +305,20 @@ async function dispatch(rule, ctx) {
       else if (repairAction?.action === 'blocked') runStatus = 'blocked';
       else if (!workerCfg.repair || repairAction?.action === 'candidate_fix') runStatus = 'success';
     }
-    state.updateRun(db, runId, { status: runStatus, result: (result.stderr || result.stdout || result.error || '').slice(0, 2000) });
+    // Repair runs store the validated structured record (surviving worktree
+    // reconstruction); non-repair runs keep their existing process-output form.
+    const runResult = workerCfg.repair
+      ? JSON.stringify(buildRepairRecord({
+          data: repairRead?.ok ? repairRead.data : null,
+          action: repairAction?.action ?? null,
+          error: repairRead?.ok ? null : repairRead.error,
+          attempt: repairAttempt,
+          exitCode: result.code,
+          timedOut: result.timedOut,
+          output: result.stderr || result.stdout || result.error || '',
+        }))
+      : (result.stderr || result.stdout || result.error || '').slice(0, 2000);
+    state.updateRun(db, runId, { status: runStatus, result: runResult });
   }
   if (taskId) {
     if (workerCfg.repair) {
@@ -313,7 +333,7 @@ async function dispatch(rule, ctx) {
     }
   }
 
-  return { ok: result.ok, taskId, runId, worktree, attempt, repairAction: repairAction?.action ?? null, output: (result.stderr || result.stdout || '').slice(0, 500) };
+  return { ok: result.ok, taskId, runId, worktree, attempt, repairAttempt, repairAction: repairAction?.action ?? null, output: (result.stderr || result.stdout || '').slice(0, 500) };
 }
 
 async function handlePost(raw, headers) {

@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#
+# sandbox-exec — fixed OS/filesystem isolation boundary for the Hermes repair
+# worker (ORCH-096). Runs the given command inside a bubblewrap mount/user/pid
+# namespace with a CURATED root filesystem.
+#
+# The boundary is the sandbox, NOT the command autonomy. Command autonomy
+# (--yolo) is only acceptable because it executes INSIDE this namespace.
+#
+# Inputs are structured values only:
+#   - $SONORAN_WORKTREE  (router-injected; the only task directory mounted RW)
+#   - "$@"               (fixed argv from the router worker config)
+#
+# Task-controlled content NEVER chooses mounts, HOME, executable paths,
+# credentials, or network policy — every path below is fixed here.
+set -euo pipefail
+
+WORKTREE="${SONORAN_WORKTREE:?SONORAN_WORKTREE is required}"
+
+# Fixed sandbox policy (do NOT make these task-overridable).
+JDK="/home/dq/.local/jdks/jdk-17.0.20.1+1"
+ANDROID_SDK="/home/dq/Android/Sdk"
+HERMES_CODE="/home/dq/.hermes/hermes-agent"
+SANDBOX_HOME="/home/dq/.hermes-sandbox/home"
+
+# Curated root: only the read-only toolchain root dirs are exposed, plus a
+# minimal /dev, a fresh /proc, and tmpfs for everything else. /home is tmpfs'd
+# and then only the dedicated sandbox HOME + the worktree are mounted, so
+# ~/.git-credentials, ~/.ssh, ~/.config/sonoran, the orchestrator checkout, and
+# unrelated repos/worktrees are NOT visible.
+exec bwrap \
+  --ro-bind /usr /usr \
+  --ro-bind /bin /bin \
+  --ro-bind /sbin /sbin \
+  --ro-bind /lib /lib \
+  --ro-bind /lib64 /lib64 \
+  --ro-bind /etc /etc \
+  --dev /dev \
+  --proc /proc \
+  --tmpfs /tmp \
+  --tmpfs /var \
+  --tmpfs /run \
+  --tmpfs /home \
+  --tmpfs /root \
+  --tmpfs /media \
+  --tmpfs /mnt \
+  --tmpfs /srv \
+  --ro-bind "$JDK" /opt/jdk17 \
+  --ro-bind "$ANDROID_SDK" /opt/android-sdk \
+  --ro-bind "$HERMES_CODE" /opt/hermes-agent \
+  --ro-bind /home/dq/.local/share/uv/python /home/dq/.local/share/uv/python \
+  --bind "$SANDBOX_HOME" /home/hermes \
+  --bind "$WORKTREE" "$WORKTREE" \
+  --unshare-all \
+  --die-with-parent \
+  --chdir "$WORKTREE" \
+  --setenv HOME /home/hermes \
+  --setenv HERMES_HOME /home/hermes/.hermes \
+  --setenv JAVA_HOME /opt/jdk17 \
+  --setenv ANDROID_HOME /opt/android-sdk \
+  --setenv ANDROID_SDK_ROOT /opt/android-sdk \
+  --setenv PATH "/opt/jdk17/bin:/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/android-sdk/cmake/3.22.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  -- "$@"

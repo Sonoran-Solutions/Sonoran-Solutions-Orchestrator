@@ -2,7 +2,7 @@
 
 Hermes is the **bounded CI repair technician** in the Sonoran Solutions workflow.
 
-It should not blindly watch a shared branch and continuously mutate code. The target model is narrower: an **authorized task** receives an isolated worktree/lease, Hermes reproduces a concrete CI failure, attempts a small mechanical repair, pushes a candidate, and then waits for **independent GitHub Actions verification + review**.
+It should not blindly watch a shared branch and continuously mutate code. The target model is narrower: an **authorized task** receives an isolated worktree/lease, Hermes reproduces a concrete CI failure, attempts a small mechanical repair inside a real OS sandbox, records a local candidate commit + structured result, and then waits for **independent GitHub Actions verification + review**.
 
 See [`fix-build.skill.md`](fix-build.skill.md) for the operating procedure and [`../IMPLEMENTATION_ROADMAP.md`](../IMPLEMENTATION_ROADMAP.md) for the M2 pilot.
 
@@ -14,7 +14,7 @@ Hermes may:
 - inspect the files implicated by that failure;
 - make a small repair inside the assigned `allowed_paths`;
 - run the canonical local CI command;
-- push a candidate fix;
+- record a LOCAL candidate commit and return structured evidence;
 - escalate with evidence when it is stuck or judgment is required.
 
 Hermes may **not**:
@@ -24,7 +24,8 @@ Hermes may **not**:
 - weaken meaningful tests just to get green;
 - share a dirty checkout with another worker;
 - declare its own local result authoritative;
-- merge its own repair.
+- merge its own repair;
+- push (ORCH-080/router-owned push remains open — it has no owner Git credentials).
 
 ## Pilot setup
 
@@ -78,11 +79,21 @@ local canonical CI command
              (initial policy)
 ```
 
+## Security boundary
+
+Hermes runs inside `sandbox-exec` (bubblewrap) with a curated root filesystem —
+see [INSTALL.md](INSTALL.md). Env allowlisting (router) and filesystem
+sandboxing (launcher) are **separate** boundaries. `--yolo` is only acceptable
+because it executes inside the sandbox; the sandbox is the security boundary.
+Hermes's effective HOME is a dedicated sandbox home, not the owner's HOME.
+
 ## Attempt policy
 
-The attempt ceiling comes from the router, not from Hermes. The control plane
-refuses attempt `N+1` before launching a worker, so a fourth autonomous repair
-attempt is impossible without human re-authorization.
+The attempt ceiling comes from the router, not from Hermes. It counts **repair
+attempts only** — unrelated planning/implementation runs on the same task do not
+consume the budget. The control plane refuses repair attempt `N+1` before
+launching a worker, so a fourth autonomous repair attempt is impossible without
+human re-authorization.
 
 For the initial pilot the limit is **3 attempts**. Reaching the limit means
 escalation, not resetting the counter.
@@ -91,8 +102,10 @@ escalation, not resetting the counter.
 
 Hermes writes a structured JSON result to `$SONORAN_RESULT_FILE` (status:
 `candidate_fix` / `no_fix` / `escalate` / `blocked`, plus evidence fields). The
-router interprets that result; `escalate`/`blocked` stop the autonomous loop.
-Free-form worker prose never mutates router state.
+router validates it (including that the claimed `attempt` matches the
+router-owned repair attempt) and **durably persists** it into `runs.result`, so
+worktree reconstruction cannot lose it. `escalate`/`blocked` stop the autonomous
+loop. Free-form worker prose never mutates router state.
 
 ## Slack policy
 
@@ -113,7 +126,11 @@ Detailed logs belong in GitHub/task logs.
 |---|---|
 | `fix-build.skill.md` | Repair procedure, `SONORAN_*` context, structured result, escalation. |
 | `triggers.md` | How Hermes should be awakened without bypassing task authorization/state. |
-| `INSTALL.md` | Install/version/config/upgrade + smoke test for the self-hosted machine. |
+| `INSTALL.md` | Install/version/config/upgrade, sandbox, skill deployment + smoke tests. |
+| `sandbox-exec` | The fixed OS filesystem sandbox (bubblewrap curated root). |
+| `run-hermes-sandboxed` | Router-facing launcher that runs Hermes inside `sandbox-exec`. |
+| `deploy-fix-build-skill.sh` | Deploys the repo-controlled `fix-build` skill into the sandbox HOME. |
+| `sandbox-test.sh` | Deterministic boundary tests (worktree RW, host-credential denial). |
 
 ## Accuracy note
 

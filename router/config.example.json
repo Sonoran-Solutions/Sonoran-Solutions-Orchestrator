@@ -30,7 +30,7 @@
       "envAllowlist": ["PATH", "HOME"]
     },
     "hermes": {
-      "program": "hermes",
+      "program": "../hermes-watch/run-hermes-sandboxed",
       "args": ["-z", "{{prompt}}", "--in", "{{worktree}}", "--skills", "fix-build", "--yolo"],
       "createsTask": true,
       "repair": true,

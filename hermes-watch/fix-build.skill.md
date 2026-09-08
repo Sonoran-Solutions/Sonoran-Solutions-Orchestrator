@@ -1,6 +1,14 @@
 ---
 name: fix-build
 description: Diagnose and attempt one bounded mechanical repair for an authorized task/CI failure, write a structured JSON result, then stop. Escalate (never guess) when the fix requires API/schema/product/security judgment, exceeds scope, or reaches the attempt limit.
+version: 1.0.0
+author: Sonoran Solutions
+license: MIT
+platforms: [linux]
+metadata:
+  hermes:
+    tags: [ci, repair, build, sonoran]
+    category: software-development
 ---
 
 # fix-build — bounded CI repair
@@ -35,18 +43,36 @@ The router launches you with only these structured `SONORAN_*` variables (plus a
 - `SONORAN_RESULT_FILE` — path where you MUST write your structured JSON result.
 
 Router-only secrets (webhook signing secret, Slack webhook URL, GitHub admin
-credentials) are **never** in your environment.
+credentials, SSH keys, owner Git credentials) are **never** in your environment
+or filesystem view.
+
+## Sandbox & identity
+
+- You run inside an OS filesystem sandbox. Your effective `HOME` is a dedicated
+  sandbox home, not the owner's home; you cannot read the owner's credentials,
+  SSH keys, Sonoran config, the orchestrator checkout, or unrelated repos.
+- Your git identity is a harmless dedicated identity (e.g. `Sonoran Hermes
+  Repair Worker <hermes@local>`). You have **no** owner Git credentials and
+  **cannot** push — candidate publication happens later through the router.
+- You may create a LOCAL candidate commit inside the worktree only.
+
+## Lease & context (router-validated)
+
+The router validates and reserves your execution BEFORE launching you. Possessing
+`$SONORAN_LEASE_ID` is NOT proof the lease is still valid, and you cannot query
+router state to check it yourself. What you CAN do is compare the structured
+context you received against the checkout and stop on mismatch.
 
 ## Before editing
 
 1. `cd` into `$SONORAN_WORKTREE` and confirm it is the assigned worktree.
 2. Confirm `$SONORAN_BRANCH` / `$SONORAN_BASE_SHA` match the checkout; if the
-   branch moved or the base is unexpected, stop and escalate.
-3. Confirm the task lease is still valid (you have `$SONORAN_LEASE_ID`).
-4. Run `$SONORAN_BUILD_CMD` and reproduce the failure.
+   branch moved or the base is unexpected, stop and report `blocked` (do not
+   claim the lease is valid — you cannot validate it independently).
+3. Run `$SONORAN_BUILD_CMD` and reproduce the failure.
 
 If the failure cannot be reproduced, the branch moved unexpectedly, or the
-worktree is wrong, stop and report/escalate. Do not guess.
+worktree is wrong, stop and return `blocked`. Do not guess.
 
 ## Repair loop (one attempt)
 
@@ -112,6 +138,10 @@ At the end of the attempt, write JSON to `$SONORAN_RESULT_FILE`:
   "escalation_reason": ""
 }
 ```
+
+`attempt` MUST echo the router-provided `$SONORAN_ATTEMPT` value — the router
+owns the attempt number and rejects any result that claims a different one.
+`files_changed` and `commands_executed` must be arrays of strings when present.
 
 `status` must be exactly one of:
 

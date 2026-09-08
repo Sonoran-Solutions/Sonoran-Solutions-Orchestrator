@@ -18,17 +18,34 @@ deliberate repair and M2.4 merge policy remain intentionally untouched.
 - **ORCH-095** — Hermes agent installed/pinned: `v0.21.1` (`f03ed94a`),
   launcher `~/.local/bin/hermes`, data `~/.hermes`; `hermes --version` smoke OK.
   Runbook: [`hermes-watch/INSTALL.md`](hermes-watch/INSTALL.md).
-- **ORCH-096/097** — Hermes worker receives an explicit `SONORAN_*` task/run/lease
-  context (worktree, repo, branch, base SHA, allowed paths, attempt/max, build
-  command, result file) via the env allowlist; the fix-build skill writes a
-  structured JSON result (`candidate_fix`/`no_fix`/`escalate`/`blocked`).
-- **ORCH-098** — control-plane-enforced `maxAttempts: 3`; attempt 4 is refused
-  before a worker launches and the task is escalated.
+- **ORCH-096** — REAL OS/filesystem sandbox via `hermes-watch/sandbox-exec`
+  (bubblewrap curated root): assigned worktree RW + dedicated sandbox HOME
+  (`/home/hermes`) + read-only toolchain; host `~/.git-credentials`, `~/.ssh`,
+  `~/.config/sonoran`, the orchestrator checkout, and unrelated repos are NOT
+  visible. Proven by `hermes-watch/sandbox-test.sh`. Env allowlisting and
+  filesystem sandboxing are separate boundaries; `--yolo` is only used inside the
+  sandbox.
+- **ORCH-097** — fix-build skill deployed from the repo source
+  (`hermes-watch/deploy-fix-build-skill.sh`) into the sandbox Hermes HOME; the
+  REAL Hermes (through the sandbox) lists `fix-build | software-development |
+  local | local | enabled`; the skill consumes `SONORAN_*` context and writes a
+  structured result. Lease-validation wording corrected (possessing
+  `SONORAN_LEASE_ID` is not validation).
+- **ORCH-098** — control-plane-enforced repair-attempt limit. The budget counts
+  REPAIR attempts only (new `runs.repair_attempt` column + `nextRepairAttempt`);
+  unrelated planning/implementation runs do not consume it. Repair attempt 4 is
+  refused before a worker launches.
 - **ORCH-099** — `escalate`/`blocked` results stop the autonomous repair loop;
   a subsequent automatic dispatch is refused (human re-authorization required).
-- **Tests** — router suite is `50 passed, 0 failed` (9 new Hermes plumbing tests
-  against a fake executable: structured context, secret exclusion, attempt
-  boundary, escalation terminal, blocked refusal, nonzero-exit durability).
+- **Blocker 4** — the validated structured repair result is durably persisted into
+  `runs.result` (status, attempt, files/commands, root cause, summary, uncertainty,
+  escalation reason, exit code, timeout, output excerpt); the result's claimed
+  `attempt` must match the router-owned repair attempt, and evidence survives
+  worktree reconstruction + SQLite reopen.
+- **Tests** — router suite is `54 passed, 0 failed` (repair-specific attempt
+  accounting, attempt-mismatch rejection, durable-evidence persistence across
+  reconstruction + reopen, non-repair runs not consuming the budget), plus
+  `hermes-watch/sandbox-test.sh` (filesystem boundary).
 
 ## Done (earlier sessions)
 

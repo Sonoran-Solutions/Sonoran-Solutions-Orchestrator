@@ -762,6 +762,45 @@ test('hermes: attempt boundary — 3 allowed, 4 refused (ORCH-098)', () => {
   assert(attemptExceeded(4, 3) === true, 'attempt 4 refused');
 });
 
+test('hermes: result attempt must match the router-owned repair attempt (blocker 4)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-hermes-att-'));
+  const p = join(dir, 'r.json');
+  writeFileSync(p, JSON.stringify({ status: 'no_fix', attempt: 1 }));
+  assert(readRepairResult(p, { expectedAttempt: 1 }).ok === true, 'matching attempt accepted');
+  assert(readRepairResult(p, { expectedAttempt: 2 }).ok === false, 'mismatched attempt rejected');
+  writeFileSync(p, JSON.stringify({ status: 'no_fix' }));
+  assert(readRepairResult(p, { expectedAttempt: 1 }).ok === false, 'missing attempt rejected');
+  writeFileSync(p, JSON.stringify({ status: 'no_fix', attempt: 1, files_changed: 'not-an-array' }));
+  assert(readRepairResult(p, { expectedAttempt: 1 }).ok === false, 'files_changed must be an array');
+  writeFileSync(p, JSON.stringify({ status: 'no_fix', attempt: 1, commands_executed: 42 }));
+  assert(readRepairResult(p, { expectedAttempt: 1 }).ok === false, 'commands_executed must be an array');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('state: repair attempts count only repair runs; evidence survives SQLite reopen (blocker 3/4)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-repair-state-'));
+  const dbPath = join(dir, 's.sqlite');
+  let db = state.openDb(dbPath);
+  state.createTask(db, { id: 'dualdex-40', repo: 'r/r', issue: '40', state: 'in_progress' });
+  // Two unrelated non-repair runs (planning + implementation).
+  state.createRun(db, { id: 'r1', taskId: 'dualdex-40', agent: 'codex', attempt: 1, status: 'success' });
+  state.createRun(db, { id: 'r2', taskId: 'dualdex-40', agent: 'antigravity', attempt: 2, status: 'success' });
+  assert(state.nextAttempt(db, 'dualdex-40') === 3, 'global attempt counts all runs');
+  assert(state.nextRepairAttempt(db, 'dualdex-40') === 1, 'repair attempt ignores non-repair runs');
+  // One repair run with durable structured evidence.
+  state.createRun(db, { id: 'r3', taskId: 'dualdex-40', agent: 'hermes', attempt: 3, repairAttempt: 1, status: 'running' });
+  state.updateRun(db, 'r3', { status: 'failed', result: JSON.stringify({ kind: 'repair', status: 'no_fix', attempt: 1, root_cause: 'first hypothesis', commands_executed: ['./ci.sh test'], uncertainty: 'low' }) });
+  assert(state.nextRepairAttempt(db, 'dualdex-40') === 2, 'one repair attempt consumed so far');
+  // Close + reopen: count and evidence survive.
+  state.close(db);
+  db = state.openDb(dbPath);
+  assert(state.nextRepairAttempt(db, 'dualdex-40') === 2, 'repair count survives reopen');
+  const runs = state.repairRuns(db, 'dualdex-40');
+  assert(runs.length === 1 && runs[0].repair_attempt === 1 && runs[0].agent === 'hermes', 'only the repair run listed');
+  assert(JSON.parse(runs[0].result).root_cause === 'first hypothesis', 'durable structured evidence survives reopen');
+  state.close(db); rmSync(dir, { recursive: true, force: true });
+});
+
 test('workers: repair env injects structured SONORAN_* metadata and never leaks secrets', () => {
   const env = {
     PATH: '/usr/bin', HOME: '/home/dq', LANG: 'C',
@@ -1192,7 +1231,11 @@ writeFileSync(${JSON.stringify(join(dir, 'env-dump.json'))}, JSON.stringify({
   hasSlack: ('SLACK_WEBHOOK_URL' in env),
 }));
 const r = ${resultLiteral};
-if (r && env.SONORAN_RESULT_FILE) writeFileSync(env.SONORAN_RESULT_FILE, JSON.stringify(r));
+if (r) {
+  // Echo the router-owned repair attempt (a well-behaved worker never redefines it).
+  if (env.SONORAN_ATTEMPT) r.attempt = Number(env.SONORAN_ATTEMPT);
+  if (env.SONORAN_RESULT_FILE) writeFileSync(env.SONORAN_RESULT_FILE, JSON.stringify(r));
+}
 process.exit(${exitCode});
 `;
   const p = join(dir, 'hermes-fake.mjs');
@@ -1364,6 +1407,118 @@ test('integration: hermes nonzero exit produces a durable failed run, never a fa
     assert(task.state === 'in_progress', `failed attempt stays retryable (got ${task.state})`);
   } finally {
     child.kill('SIGTERM'); await new Promise((r) => child.on('close', r)); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('integration: non-repair runs do not consume the Hermes repair budget (ORCH-098)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-hermes-budget-'));
+  const port = 8256;
+  const repoSlug = 'Sonoran-Solutions/dualdex';
+  const remoteBase = join(dir, 'git-remote');
+  const bareRepo = join(remoteBase, repoSlug) + '.git';
+  mkdirSync(dirname(bareRepo), { recursive: true });
+  spawnSync('git', ['init', '--bare', '--quiet', bareRepo], { cwd: dir }).status === 0 || assert(false, 'bare init');
+  const seed = join(dir, 'seed');
+  mkdirSync(seed);
+  runGit(seed, ['init', '-q']); runGit(seed, ['config', 'user.email', 't@t']); runGit(seed, ['config', 'user.name', 't']);
+  runGit(seed, ['remote', 'add', 'origin', bareRepo]);
+  writeFileSync(join(seed, 'f.txt'), 'hello'); runGit(seed, ['add', 'f.txt']); runGit(seed, ['commit', '-qm', 'init']);
+  runGit(seed, ['branch', '-M', 'main']); runGit(seed, ['push', '-q', '-u', 'origin', 'main']);
+  spawnSync('git', ['symbolic-ref', 'HEAD', 'refs/heads/main'], { cwd: bareRepo }).status === 0 || assert(false, 'bare HEAD');
+  const baseSha = runGit(seed, ['rev-parse', 'HEAD']).trim();
+
+  const hermesFixture = writeFakeHermes(dir, { result: { status: 'no_fix' }, exitCode: 0 });
+  const cfg = {
+    port, devMode: false, bodyLimitBytes: 65536, defaultTimeoutMs: 20000, maxConcurrency: 4,
+    githubSecretEnv: 'GITHUB_WEBHOOK_SECRET', slackWebhookEnv: 'SLACK_WEBHOOK_URL',
+    stateDb: join(dir, 'state.sqlite'), reposRoot: join(dir, 'repos'), worktreeRoot: join(dir, 'worktrees'),
+    repoBase: remoteBase, defaultBaseRef: 'main', reapIntervalMs: 0, leaseDurationMs: 86400000,
+    allowlist: ['trusted-user'], requireLabel: 'agent:ready',
+    workers: {
+      codex: { program: 'node', args: ['-e', 'process.exit(0)'], createsTask: true, allowedPaths: ['app/src/**'], envAllowlist: ['PATH', 'HOME'] },
+      hermes: { program: 'node', args: [hermesFixture], repair: true, maxAttempts: 3, allowedPaths: ['app/src/**'], envAllowlist: ['PATH', 'HOME'] },
+    },
+    rules: [
+      { id: 'hermes-repair', when: { events: ['issues'], actions: ['labeled'], labels: ['agent:ready', 'repair'] }, worker: 'hermes', authorize: 'label' },
+      { id: 'codex-impl', when: { events: ['issues'], actions: ['labeled'] }, worker: 'codex', authorize: 'label' },
+    ],
+  };
+  writeFileSync(join(dir, 'config.json'), JSON.stringify(cfg));
+  const child = spawn('node', ['server.mjs'], { cwd: routerDir, env: { ...process.env, CONFIG_PATH: join(dir, 'config.json'), GITHUB_WEBHOOK_SECRET: 'test-secret', SLACK_WEBHOOK_URL: 'https://hooks.slack.com/services/SECRET' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  child.stderr.on('data', () => {});
+  const mkEnv = (agent, state) => `---
+schema_version: 1
+agent: ${agent}
+to: codex
+repo: sonoran-solutions/dualdex
+issue: "40"
+branch: fix/40
+base_sha: ${baseSha}
+state: ${state}
+task: Repair
+acceptance: |
+  ./ci.sh test passes
+---`;
+  const mkBody = (agent, state, labels, delivery) => JSON.stringify({
+    action: 'labeled', sender: { login: 'trusted-user' }, repository: { full_name: repoSlug },
+    label: { name: 'agent:ready' }, issue: { number: 40, title: 'T', body: mkEnv(agent, state), labels },
+  });
+  try {
+    await waitFor(() => httpRequest(port, { method: 'GET', path: '/health' }).then((r) => r.status === 200), 6000);
+    // Two non-repair (codex) runs on the same task.
+    for (const [state, d] of [['planned', 'd-b1'], ['in_progress', 'd-b2']]) {
+      const body = mkBody('codex', state, [{ name: 'agent:ready' }], d);
+      const res = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': d, 'X-Hub-Signature-256': sign('test-secret', body) }, body });
+      assert(res.status === 200 && res.body.ok === true, `codex run allowed: ${JSON.stringify(res.body)}`);
+    }
+    // Hermes repairs 1..3 are allowed under a repair-specific budget.
+    for (let i = 1; i <= 3; i++) {
+      const body = mkBody('hermes', 'in_progress', [{ name: 'agent:ready' }, { name: 'repair' }], `d-rep-${i}`);
+      const res = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': `d-rep-${i}`, 'X-Hub-Signature-256': sign('test-secret', body) }, body });
+      assert(res.status === 200 && res.body.ok === true && res.body.repairAttempt === i, `hermes repair ${i} allowed (repairAttempt ${i}): ${JSON.stringify(res.body)}`);
+    }
+    const body4 = mkBody('hermes', 'in_progress', [{ name: 'agent:ready' }, { name: 'repair' }], 'd-rep-4');
+    const res4 = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-rep-4', 'X-Hub-Signature-256': sign('test-secret', body4) }, body: body4 });
+    assert(res4.status === 422 && res4.body.refusal === true && /attempt limit reached/.test(res4.body.reason), `repair 4 refused: ${JSON.stringify(res4.body)}`);
+  } finally {
+    child.kill('SIGTERM'); await new Promise((r) => child.on('close', r));
+    const rdb = new DatabaseSync(join(dir, 'state.sqlite'), { readOnly: true });
+    const allRuns = rdb.prepare('SELECT * FROM runs WHERE task_id = ? ORDER BY attempt ASC').all('dualdex-40');
+    rdb.close();
+    const repairRuns = allRuns.filter((r) => r.repair_attempt != null);
+    const nonRepairRuns = allRuns.filter((r) => r.repair_attempt == null);
+    assert(nonRepairRuns.length === 2, `2 non-repair runs (got ${nonRepairRuns.length})`);
+    assert(repairRuns.length === 3, `exactly 3 repair runs (got ${repairRuns.length})`);
+    assert(repairRuns.map((r) => r.repair_attempt).join(',') === '1,2,3', `repair attempts are 1,2,3 (got ${repairRuns.map((r) => r.repair_attempt)})`);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('integration: structured repair evidence persists after worktree reconstruction (blocker 4)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-hermes-evidence-'));
+  const port = 8257;
+  const fixture = writeFakeHermes(dir, { result: { status: 'no_fix', root_cause: 'first hypothesis', commands_executed: ['./ci.sh test'], uncertainty: 'low' }, exitCode: 0 });
+  const { repoSlug, baseSha, child } = await startHermesRouter(dir, port, { program: 'node', args: [fixture], repair: true, maxAttempts: 3, allowedPaths: ['app/src/**'], envAllowlist: ['PATH', 'HOME'] });
+  try {
+    // Attempt 1: no_fix with structured evidence.
+    const body1 = hermesIssueBody(repoSlug, baseSha, 'planned', 'd-hev-1');
+    const res1 = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-hev-1', 'X-Hub-Signature-256': sign('test-secret', body1) }, body: body1 });
+    assert(res1.status === 200 && res1.body.ok === true && res1.body.repairAttempt === 1, `attempt 1 dispatched: ${JSON.stringify(res1.body)}`);
+    // Attempt 2 reconstructs the worktree (destroying attempt 1's result file).
+    const body2 = hermesIssueBody(repoSlug, baseSha, 'in_progress', 'd-hev-2');
+    const res2 = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-hev-2', 'X-Hub-Signature-256': sign('test-secret', body2) }, body: body2 });
+    assert(res2.status === 200 && res2.body.ok === true && res2.body.repairAttempt === 2, `attempt 2 dispatched: ${JSON.stringify(res2.body)}`);
+  } finally {
+    child.kill('SIGTERM'); await new Promise((r) => child.on('close', r));
+    const rdb = new DatabaseSync(join(dir, 'state.sqlite'), { readOnly: true });
+    const runs = rdb.prepare('SELECT * FROM runs WHERE task_id = ? AND repair_attempt IS NOT NULL ORDER BY repair_attempt ASC').all('dualdex-40');
+    rdb.close();
+    assert(runs.length === 2, `two repair runs persisted (got ${runs.length})`);
+    const first = JSON.parse(runs[0].result);
+    assert(first.kind === 'repair' && first.status === 'no_fix', 'attempt 1 record is a structured repair record');
+    assert(first.root_cause === 'first hypothesis' && Array.isArray(first.commands_executed) && first.uncertainty === 'low', 'attempt 1 structured evidence survived worktree reconstruction');
+    assert(first.attempt === 1 && runs[1].repair_attempt === 2, 'attempts recorded as 1 and 2');
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

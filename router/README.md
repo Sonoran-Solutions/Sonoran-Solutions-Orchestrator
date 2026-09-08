@@ -46,7 +46,7 @@ router/
 | Exactly one active lease per task; stale lease never reaps an owned worktree | ✅ |
 | Worker env hygiene: allowlist-only environment (no router-secret leakage) | ✅ |
 | Hermes bounded repair worker: structured `SONORAN_*` context, structured result file, attempt limit, escalation terminal | ✅ |
-| Tests: 50 passing (`node test.mjs`) | ✅ |
+| Tests: 54 passing (`node test.mjs`) + `hermes-watch/sandbox-test.sh` | ✅ |
 
 A random public issue/PR **cannot** launch a worker: it needs a valid signature,
 an untrusted actor is rejected, a code-editing dispatch additionally needs a
@@ -127,20 +127,28 @@ falling back to the PR base ref when the event carries one.
 A worker with `"repair": true` is a bounded repair worker (and is inherently a
 code worker, so it always gets an envelope + worktree + lease). It additionally:
 
+- runs behind the fixed sandbox launcher (`program` points at
+  `../hermes-watch/run-hermes-sandboxed`, not the raw `hermes` binary), so it
+  gets a curated filesystem (assigned worktree RW + dedicated sandbox HOME + a
+  read-only toolchain; no owner credentials/SSH/Sonoran config);
 - receives structured `SONORAN_*` context instead of a free-form prompt: task/run/
-  lease IDs, repo, branch, base SHA, attempt/max-attempts, allowed/task paths,
-  canonical build command, and `SONORAN_RESULT_FILE`;
+  lease IDs, repo, branch, base SHA, REPAIR attempt/max-attempts, allowed/task
+  paths, canonical build command, and `SONORAN_RESULT_FILE`;
 - must write a structured JSON result to `SONORAN_RESULT_FILE` with `status` in
-  `candidate_fix | no_fix | escalate | blocked`;
-- is subject to a control-plane-enforced attempt limit (`maxAttempts`, default
-  `3`): attempt `N+1` is refused before a worker launches and the task is
-  escalated;
+  `candidate_fix | no_fix | escalate | blocked` and a `attempt` that matches the
+  router-owned repair attempt;
+- is subject to a control-plane-enforced **repair-attempt** limit (`maxAttempts`,
+  default `3`): repair attempt `N+1` is refused before a worker launches. The
+  budget counts repair runs only — unrelated planning/implementation runs do not
+  consume it;
 - has `escalate`/`blocked` treated as terminal for the autonomous loop: the next
-  automatic dispatch is refused until a human re-authorizes.
+  automatic dispatch is refused until a human re-authorizes;
+- has its validated structured evidence **durably persisted** into `runs.result`
+  (surviving worktree reconstruction), via the `repair_attempt` column.
 
 ```jsonc
 "hermes": {
-  "program": "hermes",
+  "program": "../hermes-watch/run-hermes-sandboxed",
   "args": ["-z", "{{prompt}}", "--in", "{{worktree}}", "--skills", "fix-build", "--yolo"],
   "createsTask": true, "repair": true, "maxAttempts": 3,
   "buildCmd": "./ci.sh test",
@@ -149,8 +157,9 @@ code worker, so it always gets an envelope + worktree + lease). It additionally:
 }
 ```
 
-The router interprets the structured result; free-form worker prose never mutates
-router state.
+The router interprets + persists the structured result; free-form worker prose
+never mutates router state. Env allowlisting (router) and filesystem sandboxing
+(the launcher) are separate boundaries.
 
 ### Allowed-path policy (two scopes, never widening)
 

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+#
+# run-hermes-sandboxed — the router-facing launcher for the Hermes repair worker.
+# It runs the REAL installed Hermes binary inside the sandbox-exec boundary.
+#
+# The router invokes this fixed executable (see router/config.example.json).
+# All command autonomy (--yolo) happens INSIDE the sandbox; the sandbox is the
+# security boundary, and Hermes has no owner Git credentials or router secrets.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+exec "$here/sandbox-exec" \
+  /opt/hermes-agent/venv/bin/python /opt/hermes-agent/hermes "$@"
