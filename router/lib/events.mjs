@@ -12,6 +12,7 @@ export function normalize(headers, body) {
 
   return {
     deliveryId: String(headers['x-github-delivery'] || ''),
+    triggerLabel: String(body.label?.name || ''),
     event: String(headers['x-github-event'] || ''),
     action: String(body.action || ''),
     repo: String(body.repository?.full_name || ''),

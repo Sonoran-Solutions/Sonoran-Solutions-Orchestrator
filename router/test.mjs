@@ -14,6 +14,8 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { pathMatches, verifyRepairCandidate } from './lib/repair-verify.mjs';
+import { makeTaskId, containedPath } from './lib/task-id.mjs';
 
 const routerDir = dirname(fileURLToPath(import.meta.url));
 let passed = 0; let failed = 0;
@@ -457,8 +459,8 @@ test('worktrees: push guard blocks base-branch movement + direct base push + sco
   const wtRoot = join(dir, 'worktrees');
   const wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha, branch: 'feat/1' });
   installPushGuard(wt, { workerAllowedPaths: ['*'], taskAllowedPaths: [], baseSha, baseRef: 'main' });
-  assert(readFileSync(join(wt, '.sonoran-base-sha'), 'utf8').trim() === baseSha, 'base-sha file written');
-  assert(readFileSync(join(wt, '.sonoran-base-ref'), 'utf8').trim() === 'main', 'base-ref file written');
+  assert(readFileSync(join(resolveGitDir(wt), 'sonoran/base-sha'), 'utf8').trim() === baseSha, 'base-sha file written');
+  assert(readFileSync(join(resolveGitDir(wt), 'sonoran/base-ref'), 'utf8').trim() === 'main', 'base-ref file written');
 
   const hook = join(resolveGitDir(wt), 'hooks', 'pre-push');
   const localSha = runGit(wt, ['rev-parse', 'HEAD']).trim();
@@ -548,7 +550,7 @@ test('worktrees: omitted task scope means worker-baseline-only, never deny-all; 
   // A. worker=['app/src/**'], task scope OMITTED -> app/src/foo.js allowed (not deny-all).
   let wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'o1', baseSha, branch: 'feat-omitted' });
   installPushGuard(wt, { workerAllowedPaths: ['app/src/**'], taskAllowedPaths: [], baseSha, baseRef: 'main' });
-  assert(!existsSync(join(wt, '.sonoran-task-allowed-paths')), 'no task-scope file is written when task scope is omitted');
+  assert(!existsSync(join(resolveGitDir(wt), 'sonoran/task-allowed-paths')), 'no task-scope file is written when task scope is omitted');
   let hook = join(resolveGitDir(wt), 'hooks', 'pre-push');
   let sha = commit(wt, 'app/src/foo.js');
   let r = push(hook, wt, 'feat-omitted', sha);
@@ -570,9 +572,9 @@ test('worktrees: omitted task scope means worker-baseline-only, never deny-all; 
   //    is now allowed.
   wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'o3', baseSha, branch: 'feat-stale' });
   installPushGuard(wt, { workerAllowedPaths: ['app/src/**'], taskAllowedPaths: ['app/src/import/**'], baseSha, baseRef: 'main' });
-  assert(existsSync(join(wt, '.sonoran-task-allowed-paths')), 'task scope present on first install');
+  assert(existsSync(join(resolveGitDir(wt), 'sonoran/task-allowed-paths')), 'task scope present on first install');
   installPushGuard(wt, { workerAllowedPaths: ['app/src/**'], taskAllowedPaths: [], baseSha, baseRef: 'main' });
-  assert(!existsSync(join(wt, '.sonoran-task-allowed-paths')), 'stale task-scope file removed when task scope omitted');
+  assert(!existsSync(join(resolveGitDir(wt), 'sonoran/task-allowed-paths')), 'stale task-scope file removed when task scope omitted');
   hook = join(resolveGitDir(wt), 'hooks', 'pre-push');
   sha = commit(wt, 'app/src/other.js'); // within worker baseline, outside the old app/src/import/**
   r = push(hook, wt, 'feat-stale', sha);
@@ -720,7 +722,7 @@ test('state: expired lease list + removeWorktreePath + releaseLease (ORCH-083)',
   assert(expired.length === 1 && expired[0].id === 'lease-x', 'expired lease listed');
   assert(expired[0].source_repo === src, 'lease records source repo');
 
-  removeWorktreePath(src, wt);
+  removeWorktreePath(src, wt, dirname(wt));
   assert(!runGit(src, ['worktree', 'list']).includes('t2'), 'expired worktree removed');
 
   state.releaseLease(db, 'lease-x');
@@ -1063,11 +1065,11 @@ acceptance: |
     // The router writes .sonoran-* metadata into the worktree; those are expected.
     const status = runGit(wt, ['status', '--porcelain']).split('\n').filter((l) => l && !/\.sonoran-/.test(l)).join('\n');
     assert(status === '', 'worktree is clean at launch (ignoring router metadata files)');
-    assert(readFileSync(join(wt, '.sonoran-base-sha'), 'utf8').trim() === baseSha, 'push guard records the verified base SHA');
-    assert(readFileSync(join(wt, '.sonoran-base-ref'), 'utf8').trim() === 'main', 'push guard records the base ref');
+    assert(readFileSync(join(resolveGitDir(wt), 'sonoran/base-sha'), 'utf8').trim() === baseSha, 'push guard records the verified base SHA');
+    assert(readFileSync(join(resolveGitDir(wt), 'sonoran/base-ref'), 'utf8').trim() === 'main', 'push guard records the base ref');
     // Path policy: worker baseline AND task scope are both installed independently.
-    assert(readFileSync(join(wt, '.sonoran-worker-allowed-paths'), 'utf8').trim() === 'app/src/**\nnative/**', 'worker baseline written');
-    assert(readFileSync(join(wt, '.sonoran-task-allowed-paths'), 'utf8').trim() === 'app/src/import/**', 'task scope written');
+    assert(readFileSync(join(resolveGitDir(wt), 'sonoran/worker-allowed-paths'), 'utf8').trim() === 'app/src/**\nnative/**', 'worker baseline written');
+    assert(readFileSync(join(resolveGitDir(wt), 'sonoran/task-allowed-paths'), 'utf8').trim() === 'app/src/import/**', 'task scope written');
 
     // Negative: a brand-new task (issue 26) declaring an illegal initial state is refused.
     const badEnvelope = `---
@@ -1199,7 +1201,7 @@ test('integration: a second delivery during a LIVE execution is refused; the liv
   const baseSha = runGit(seed, ['rev-parse', 'HEAD']).trim();
 
   const cfg = {
-    port, devMode: false, bodyLimitBytes: 65536, defaultTimeoutMs: 20000, maxConcurrency: 4,
+    port, devMode: true, testFixtures: true, bodyLimitBytes: 65536, defaultTimeoutMs: 20000, maxConcurrency: 4,
     githubSecretEnv: 'GITHUB_WEBHOOK_SECRET', slackWebhookEnv: 'SLACK_WEBHOOK_URL',
     stateDb: join(dir, 'state.sqlite'), reposRoot: join(dir, 'repos'), worktreeRoot: join(dir, 'worktrees'),
     repoBase: remoteBase, defaultBaseRef: 'main', reapIntervalMs: 0, leaseDurationMs: 86400000,
@@ -1269,7 +1271,7 @@ acceptance: |
     rdb.close();
     assert(runs.length === 2, `exactly 2 runs (first + retry); the refused second created none (got ${runs.length})`);
     assert(runs.some((r) => r.status === 'success'), 'completed run recorded as success');
-    assert(activeLeases.length === 1, `exactly one active lease (got ${activeLeases.length})`);
+    assert(activeLeases.length === 0, `completed runs release leases (got ${activeLeases.length})`);
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -1335,12 +1337,12 @@ async function startHermesRouter(dir, port, hermesWorker) {
   spawnSync('git', ['symbolic-ref', 'HEAD', 'refs/heads/main'], { cwd: bareRepo }).status === 0 || assert(false, 'bare HEAD');
   const baseSha = runGit(seed, ['rev-parse', 'HEAD']).trim();
   const cfg = {
-    port, devMode: false, bodyLimitBytes: 65536, defaultTimeoutMs: 20000, maxConcurrency: 4,
+    port, devMode: true, testFixtures: true, bodyLimitBytes: 65536, defaultTimeoutMs: 20000, maxConcurrency: 4,
     githubSecretEnv: 'GITHUB_WEBHOOK_SECRET', slackWebhookEnv: 'SLACK_WEBHOOK_URL',
     stateDb: join(dir, 'state.sqlite'), reposRoot: join(dir, 'repos'), worktreeRoot: join(dir, 'worktrees'),
     repoBase: remoteBase, defaultBaseRef: 'main', reapIntervalMs: 0, leaseDurationMs: 86400000,
     allowlist: ['trusted-user'], requireLabel: 'agent:ready',
-    workers: { hermes: hermesWorker },
+    workers: { hermes: { ...hermesWorker, testFixture: true } },
     rules: [{ id: 'hermes-repair', when: { events: ['issues'], actions: ['labeled'] }, worker: 'hermes', authorize: 'label' }],
   };
   writeFileSync(join(dir, 'config.json'), JSON.stringify(cfg));
@@ -1377,13 +1379,13 @@ function hermesIssueBody(repoSlug, baseSha, state, delivery) {
 test('integration: hermes repair receives the worktree + full structured context, never router secrets', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'sonoran-hermes-ctx-'));
   const port = 8251;
-  const fixture = writeFakeHermes(dir, { result: { status: 'candidate_fix', attempt: 1 }, exitCode: 0 });
+  const fixture = writeFakeHermes(dir, { result: { status: 'no_fix', attempt: 1 }, exitCode: 0 });
   const { repoSlug, baseSha, child } = await startHermesRouter(dir, port, { program: 'node', args: [fixture], repair: true, maxAttempts: 3, buildCmd: './ci.sh test', allowedPaths: ['app/src/**', 'native/**'], envAllowlist: ['PATH', 'HOME'] });
   try {
     const body = hermesIssueBody(repoSlug, baseSha, 'planned', 'd-hctx-1');
     const res = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-hctx-1', 'X-Hub-Signature-256': sign('test-secret', body) }, body });
     assert(res.status === 200 && res.body.ok === true, `hermes dispatched: ${JSON.stringify(res.body)}`);
-    assert(res.body.repairAction === 'candidate_fix', `structured result interpreted: ${JSON.stringify(res.body)}`);
+    assert(res.body.repairAction === 'no_fix', `structured result interpreted: ${JSON.stringify(res.body)}`);
     const dump = JSON.parse(readFileSync(join(dir, 'env-dump.json'), 'utf8'));
     assert(dump.worktree && dump.worktree !== join(dir, 'repos'), `worktree passed, not repo root (got ${dump.worktree})`);
     assert(dump.task === 'dualdex-40' && dump.run && dump.lease, 'task/run/lease identifiers present');
@@ -1392,7 +1394,7 @@ test('integration: hermes repair receives the worktree + full structured context
     assert(dump.baseSha === baseSha && dump.branch === 'fix/40' && dump.buildCmd === './ci.sh test', 'base/branch/build passed');
     assert(dump.attempt === '1' && dump.maxAttempts === '3', 'attempt state passed');
     assert(dump.hasWebhookSecret === false && dump.hasSlack === false, 'router secrets excluded from worker env');
-    assert(dump.resultFile && readFileSync(dump.resultFile, 'utf8').includes('candidate_fix'), 'result file written in worktree');
+    assert(dump.resultFile && !dump.resultFile.includes('.sonoran-repair-result.json') && dump.resultFile.endsWith('/repair-result.json'), 'result file uses external run state');
   } finally {
     child.kill('SIGTERM'); await new Promise((r) => child.on('close', r)); rmSync(dir, { recursive: true, force: true });
   }
@@ -1532,14 +1534,14 @@ test('integration: non-repair runs do not consume the Hermes repair budget (ORCH
 
   const hermesFixture = writeFakeHermes(dir, { result: { status: 'no_fix' }, exitCode: 0 });
   const cfg = {
-    port, devMode: false, bodyLimitBytes: 65536, defaultTimeoutMs: 20000, maxConcurrency: 4,
+    port, devMode: true, testFixtures: true, bodyLimitBytes: 65536, defaultTimeoutMs: 20000, maxConcurrency: 4,
     githubSecretEnv: 'GITHUB_WEBHOOK_SECRET', slackWebhookEnv: 'SLACK_WEBHOOK_URL',
     stateDb: join(dir, 'state.sqlite'), reposRoot: join(dir, 'repos'), worktreeRoot: join(dir, 'worktrees'),
     repoBase: remoteBase, defaultBaseRef: 'main', reapIntervalMs: 0, leaseDurationMs: 86400000,
     allowlist: ['trusted-user'], requireLabel: 'agent:ready',
     workers: {
       codex: { program: 'node', args: ['-e', 'process.exit(0)'], createsTask: true, allowedPaths: ['app/src/**'], envAllowlist: ['PATH', 'HOME'] },
-      hermes: { program: 'node', args: [hermesFixture], repair: true, maxAttempts: 3, allowedPaths: ['app/src/**'], envAllowlist: ['PATH', 'HOME'] },
+      hermes: { program: 'node', args: [hermesFixture], repair: true, testFixture: true, maxAttempts: 3, allowedPaths: ['app/src/**'], envAllowlist: ['PATH', 'HOME'] },
     },
     rules: [
       { id: 'hermes-repair', when: { events: ['issues'], actions: ['labeled'], labels: ['agent:ready', 'repair'] }, worker: 'hermes', authorize: 'label' },
@@ -1623,6 +1625,19 @@ test('integration: structured repair evidence persists after worktree reconstruc
     assert(first.attempt === 1 && runs[1].repair_attempt === 2, 'attempts recorded as 1 and 2');
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('audit remediation: matcher and task containment contracts', () => {
+  assert(pathMatches('app/src/a.js', ['app/src/**']), 'recursive matcher accepts direct child');
+  assert(pathMatches('app/src/deep/a.js', ['app/src/**']), 'recursive matcher accepts deep child');
+  assert(pathMatches('foo/bar.js', ['foo/**/bar.js']), 'double-star accepts zero segments');
+  assert(pathMatches('foo/a/bar.js', ['foo/**/bar.js']), 'double-star accepts one segment');
+  assert(pathMatches('foo/a/b/bar.js', ['foo/**/bar.js']), 'double-star accepts many segments');
+  assert(pathMatches('README.md', ['*.md']) && !pathMatches('docs/README.md', ['*.md']), 'star is root-level for root pattern');
+  assert(makeTaskId('org/repo', 3) === 'repo-3');
+  const throws = (fn) => { let did = false; try { fn(); } catch { did = true; } assert(did, 'expected rejection'); };
+  for (const bad of ['../../foo', '../foo', 'foo/bar', 'foo\\bar', '.', '..', '']) throws(() => containedPath('/tmp/root', bad));
+  throws(() => makeTaskId('org/repo', Number.MAX_SAFE_INTEGER + 1));
 });
 
 async function waitFor(fn, ms) {

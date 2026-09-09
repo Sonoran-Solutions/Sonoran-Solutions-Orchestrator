@@ -12,12 +12,16 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source="$here/fix-build.skill.md"
 
-SANDBOX_HOME="${SONORAN_SANDBOX_HOME:-/home/dq/.hermes-sandbox/home}"
+BASE="${SONORAN_HERMES_BASE:-/home/dq/.hermes-sandbox/base}"
 category="software-development"
-dest="$SANDBOX_HOME/.hermes/skills/$category/fix-build/SKILL.md"
+dest="$BASE/skills/$category/fix-build/SKILL.md"
 
 mkdir -p "$(dirname "$dest")"
-cp "$source" "$dest"
+tmp="$dest.tmp.$$"
+cp "$source" "$tmp"
+chmod 0444 "$tmp"
+mv -f "$tmp" "$dest"
+chmod 0444 "$dest"
 echo "deployed fix-build skill -> $dest"
 
 # Git identity is task-local in each router-created private repository. The

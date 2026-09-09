@@ -1,8 +1,9 @@
 // lib/worktrees.mjs — per-task git worktree + lease isolation. ORCH-077..083.
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync } from 'node:fs';
-import { isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, join, resolve, sep, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { containedPath } from './task-id.mjs';
 
 export function runGit(cwd, args) {
   return execFileSync('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] }).toString();
@@ -129,7 +130,7 @@ function credentialFreeRemoteUrl(raw) {
 // No alternates or shared object hardlinks are used, and the source repository is
 // never mounted into the worker sandbox.
 export function createWorktree({ sourceRepo, worktreeRoot, taskId, baseSha, branch }) {
-  const dest = join(worktreeRoot, taskId);
+  const dest = containedPath(worktreeRoot, taskId);
   mkdirSync(worktreeRoot, { recursive: true });
   const safeBranch = safeBranchName(branch) || `agent/${taskId}`;
   const startSha = resolveCommitSha(sourceRepo, baseSha || 'HEAD');
@@ -201,7 +202,7 @@ export function verifyCleanWorktree(path, branch, startSha) {
 //     (any stale local-only commits are discarded).
 //   - Verifies branch / non-detached / clean / starting commit before returning.
 export function prepareWorktreeForRun({ sourceRepo, worktreeRoot, taskId, baseSha, branch }) {
-  const dest = join(worktreeRoot, taskId);
+  const dest = containedPath(worktreeRoot, taskId);
   const safeBranch = safeBranchName(branch) || `agent/${taskId}`;
 
   // 1. Never inherit a prior attempt's worktree state.
@@ -233,7 +234,7 @@ export function prepareWorktreeForRun({ sourceRepo, worktreeRoot, taskId, baseSh
 }
 
 export function removeWorktree({ sourceRepo, worktreeRoot, taskId }) {
-  const dest = join(worktreeRoot, taskId);
+  const dest = containedPath(worktreeRoot, taskId);
   if (!existsSync(dest)) return;
   const dotgit = join(dest, '.git');
   // Compatibility cleanup for linked worktrees created by an older router.
@@ -273,15 +274,15 @@ const PUSH_GUARD = `#!/bin/sh
 # ask the remote for the base branch's CURRENT tip and compare it to the recorded
 # base SHA. Only the base branch's unexpected movement blocks a push.
 #
-# Allowed-path policy is TWO scopes, both enforced per changed file:
-#   .sonoran-worker-allowed-paths  = worker/repository baseline (MAXIMUM trusted boundary)
-#   .sonoran-task-allowed-paths    = optional task narrowing boundary
+# Allowed-path policy is TWO scopes, both enforced per changed file. Metadata is
+# stored under the private repository's actual git directory, never in checkout content.
 # A file must match the worker baseline AND (when a task scope exists) the task scope.
 # This is a cooperative enforcement layer, not router-owned push verification.
-worker_scope=".sonoran-worker-allowed-paths"
-task_scope=".sonoran-task-allowed-paths"
-base_ref="$(cat .sonoran-base-ref 2>/dev/null | tr -d '[:space:]')"
-base_sha="$(cat .sonoran-base-sha 2>/dev/null | tr -d '[:space:]')"
+gitdir="$(git rev-parse --git-dir 2>/dev/null || printf .git)"
+worker_scope="$gitdir/sonoran/worker-allowed-paths"
+task_scope="$gitdir/sonoran/task-allowed-paths"
+base_ref="$(cat "$gitdir/sonoran/base-ref" 2>/dev/null | tr -d '[:space:]')"
+base_sha="$(cat "$gitdir/sonoran/base-sha" 2>/dev/null | tr -d '[:space:]')"
 zero="0000000000000000000000000000000000000000"
 # Normalize to a full ref path so both the remote query and the "don't push to base"
 # comparison work whether we stored "main" or "refs/heads/main".
@@ -356,20 +357,23 @@ exit 0
 export function installPushGuard(worktreePath, { workerAllowedPaths = [], taskAllowedPaths = [], baseSha = '', baseRef = '' } = {}) {
   const gitdir = resolveGitDir(worktreePath);
   if (!gitdir) return;
-  writeFileSync(join(worktreePath, '.sonoran-worker-allowed-paths'), (workerAllowedPaths || []).join('\n') + '\n');
-  const taskFile = join(worktreePath, '.sonoran-task-allowed-paths');
+  const metadataDir = join(gitdir, 'sonoran');
+  mkdirSync(metadataDir, { recursive: true, mode: 0o700 });
+  const workerData = (workerAllowedPaths || []).join('\n') + '\n';
+  writeFileSync(join(metadataDir, 'worker-allowed-paths'), workerData, { mode: 0o600 });
+  const taskFile = join(metadataDir, 'task-allowed-paths');
   if (Array.isArray(taskAllowedPaths) && taskAllowedPaths.length) {
-    writeFileSync(taskFile, taskAllowedPaths.join('\n') + '\n');
+    writeFileSync(taskFile, taskAllowedPaths.join('\n') + '\n', { mode: 0o600 });
   } else {
     // No task narrowing supplied: remove any stale task-scope restriction so the
     // guard falls back to worker-baseline-only (not an accidental deny-all).
     try { rmSync(taskFile, { force: true }); } catch { /* already absent */ }
   }
   if (baseSha) {
-    writeFileSync(join(worktreePath, '.sonoran-base-sha'), baseSha + '\n');
+    writeFileSync(join(metadataDir, 'base-sha'), baseSha + '\n', { mode: 0o600 });
   }
   if (baseRef) {
-    writeFileSync(join(worktreePath, '.sonoran-base-ref'), baseRef + '\n');
+    writeFileSync(join(metadataDir, 'base-ref'), baseRef + '\n', { mode: 0o600 });
   }
   const hooksDir = join(gitdir, 'hooks');
   mkdirSync(hooksDir, { recursive: true });
@@ -377,8 +381,12 @@ export function installPushGuard(worktreePath, { workerAllowedPaths = [], taskAl
 }
 
 // Remove a worktree by explicit source repo + path (used by the lease reaper).
-export function removeWorktreePath(sourceRepo, worktreePath) {
-  if (!existsSync(worktreePath)) return;
+export function removeWorktreePath(sourceRepo, worktreePath, worktreeRoot = null) {
+  const root = resolve(worktreeRoot || join(worktreePath, '..'));
+  const candidate = resolve(worktreePath);
+  if (candidate === root || !candidate.startsWith(root + sep)) throw new Error('worktree path escapes configured root');
+  if (!existsSync(candidate)) return;
+  worktreePath = candidate;
   if (isPrivateRepository(worktreePath)) {
     rmSync(worktreePath, { recursive: true, force: true });
     return;
