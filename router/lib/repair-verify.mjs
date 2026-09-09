@@ -6,7 +6,7 @@ function snapshot(worktree,startSha,expectedBranch){
  const launcher=fileURLToPath(new URL("../../hermes-watch/verify-repair-sandboxed",import.meta.url));
  const raw=execFileSync(launcher,[worktree,startSha,expectedBranch],{encoding:"utf8",stdio:["ignore","pipe","pipe"]});
  const f=Object.fromEntries(raw.trim().split("\n").map(x=>{const i=x.indexOf(":");return [x.slice(0,i),x.slice(i+1)]}));
- return {branch:f.BRANCH,head:f.HEAD,status:Buffer.from(f.STATUS_B64||"","base64").toString(),files:Buffer.from(f.FILES_B64||"","base64").toString()};
+ return {branch:f.BRANCH,head:f.HEAD,status:Buffer.from(f.STATUS_B64||"","base64").toString(),files:Buffer.from(f.FILES_B64||"","base64").toString("utf8")};
 }
 // Sonoran patterns are repository-relative: * and ? never cross /; ** crosses
 // zero or more complete path segments. Thus *.md matches README.md but not docs/README.md.
@@ -18,7 +18,7 @@ export function verifyRepairCandidate({worktree,expectedBranch,startSha,workerAl
  try{x=snapshot(worktree,startSha,expectedBranch);}catch(e){return fail(`Git verification failed in verifier sandbox: ${e.message}`);}
  if(x.branch!==expectedBranch)return fail(`current branch '${x.branch}' does not equal assigned branch '${expectedBranch}'`);
  if(x.head===startSha)return fail("candidate has no committed change"); if(x.status)return fail("working tree is dirty");
- const actual=x.files.split("\n").map(v=>v.trim()).filter(Boolean).sort(); if(!actual.length)return fail("actual changed-file set is empty");
+ const actual=x.files.split("\0").filter(v=>v.length>0).sort(); if(!actual.length)return fail("actual changed-file set is empty");
  if(actual.some(v=>!pathsAllowed(v,workerAllowedPaths,taskAllowedPaths)))return fail("committed path is outside allowed scope");
  if(actual.some(v=>v===".sonoran-repair-result.json"||v.startsWith(".sonoran-")))return fail("router metadata changed");
  const declared=[...new Set((Array.isArray(declaredFiles)?declaredFiles:[]).map(String))].sort();

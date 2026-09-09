@@ -305,60 +305,54 @@ async function dispatch(rule, ctx) {
     program, args, cwd: worktree || cfg.__routerDir, env, timeoutMs: workerCfg.timeoutMs || cfg.defaultTimeoutMs,
   });
 
-  // Interpret the repair worker's structured result. The router — never the
-  // worker's prose — decides whether the autonomous repair loop continues, and
-  // durably persists the validated structured evidence (ORCH-099 / blocker 4).
+  // Interpret results and persist durable evidence. Cleanup is a true finalizer:
+  // this dispatch releases/removes only the run identity it reserved.
   let repairRead = null;
   let repairAction = null;
   let repairVerification = null;
-  if (workerCfg.repair) {
-    repairRead = readRepairResult(repairResultFile, { expectedAttempt: repairAttempt });
-    repairAction = classifyRepairResult(repairRead);
-    if (repairAction.action === 'candidate_fix' && repairRead.ok && result.ok) {
-      repairVerification = verifyRepairCandidate({ worktree, expectedBranch: envelope.branch, startSha, workerAllowedPaths, taskAllowedPaths, declaredFiles: repairRead.data.files_changed });
-      if (!repairVerification.ok) repairAction = { action: 'invalid', reason: `post-run Git verification: ${repairVerification.reason}` };
-    }
-  }
-  // A zero process exit is necessary but not sufficient for a repair success:
-  // missing, malformed, oversized, or structurally invalid evidence fails closed.
-  const outcomeOk = result.ok && (!workerCfg.repair || (repairRead?.ok === true && repairAction?.action !== 'invalid'));
-
-  if (runId) {
-    let runStatus = 'failed';
-    if (outcomeOk) {
-      if (repairAction?.action === 'escalate') runStatus = 'escalated';
-      else if (repairAction?.action === 'blocked') runStatus = 'blocked';
-      else if (!workerCfg.repair || repairAction?.action === 'candidate_fix') runStatus = 'success';
-    }
-    // Repair runs store the validated structured record (surviving worktree
-    // reconstruction); non-repair runs keep their existing process-output form.
-    const runResult = workerCfg.repair
-      ? JSON.stringify(buildRepairRecord({
-          data: repairRead?.ok ? repairRead.data : null,
-          action: repairAction?.action ?? null,
-          error: repairRead?.ok ? (repairVerification?.ok === false ? repairVerification.reason : null) : repairRead.error,
-          attempt: repairAttempt,
-          exitCode: result.code,
-          timedOut: result.timedOut,
-          output: result.stderr || result.stdout || result.error || '',
-        }))
-      : (result.stderr || result.stdout || result.error || '').slice(0, 2000);
-    state.updateRun(db, runId, { status: runStatus, result: runResult });
-    if (leaseId) state.releaseLease(db, leaseId);
-    if (runStateDir) { try { rmSync(runStateDir, { recursive: true, force: true }); } catch {} }
-    if (runHome) { try { rmSync(runHome, { recursive: true, force: true }); } catch {} }
-  }
-  if (taskId) {
+  let outcomeOk = result.ok && !workerCfg.repair;
+  try {
     if (workerCfg.repair) {
-      // Escalation/blocked are terminal for the autonomous loop; a plain failed
-      // attempt stays retryable (the attempt limit and escalation gate handle
-      // termination), so a failed repair never fabricates a blocked "success".
-      if (repairAction?.action === 'escalate') state.updateTaskState(db, taskId, 'escalated');
-      else if (repairAction?.action === 'blocked') state.updateTaskState(db, taskId, 'blocked');
-      else if (!outcomeOk) state.updateTaskState(db, taskId, 'in_progress');
-    } else if (!result.ok) {
-      state.updateTaskState(db, taskId, 'blocked');
+      repairRead = readRepairResult(repairResultFile, { expectedAttempt: repairAttempt });
+      repairAction = classifyRepairResult(repairRead);
+      if (repairAction.action === 'candidate_fix' && repairRead.ok && result.ok) {
+        repairVerification = verifyRepairCandidate({ worktree, expectedBranch: envelope.branch, startSha, workerAllowedPaths, taskAllowedPaths, declaredFiles: repairRead.data.files_changed });
+        if (!repairVerification.ok) repairAction = { action: 'invalid', reason: `post-run Git verification: ${repairVerification.reason}` };
+      }
     }
+    outcomeOk = result.ok && (!workerCfg.repair || (repairRead?.ok === true && repairAction?.action !== 'invalid'));
+    if (runId) {
+      let runStatus = 'failed';
+      if (outcomeOk) {
+        if (repairAction?.action === 'escalate') runStatus = 'escalated';
+        else if (repairAction?.action === 'blocked') runStatus = 'blocked';
+        else if (!workerCfg.repair || repairAction?.action === 'candidate_fix' || repairAction?.action === 'no_fix') runStatus = 'success';
+      }
+      const runResult = workerCfg.repair
+        ? JSON.stringify(buildRepairRecord({ data: repairRead?.ok ? repairRead.data : null, action: repairAction?.action ?? null, error: repairRead?.ok ? (repairVerification?.ok === false ? repairVerification.reason : null) : repairRead.error, attempt: repairAttempt, exitCode: result.code, timedOut: result.timedOut, output: result.stderr || result.stdout || result.error || '' }))
+        : (result.stderr || result.stdout || result.error || '').slice(0, 2000);
+      state.updateRun(db, runId, { status: runStatus, result: runResult });
+    }
+    if (taskId) {
+      if (workerCfg.repair) {
+        if (repairAction?.action === 'escalate') state.updateTaskState(db, taskId, 'escalated');
+        else if (repairAction?.action === 'blocked') state.updateTaskState(db, taskId, 'blocked');
+        else if (!outcomeOk) state.updateTaskState(db, taskId, 'in_progress');
+      } else if (!result.ok) state.updateTaskState(db, taskId, 'blocked');
+    }
+  } catch (e) {
+    outcomeOk = false;
+    const reason = String(e?.message || e).slice(0, 2000);
+    repairAction = { action: 'invalid', reason: `finalization failure: ${reason}` };
+    if (runId) {
+      try {
+        state.updateRun(db, runId, { status: 'failed', result: workerCfg.repair ? JSON.stringify(buildRepairRecord({ action: 'invalid', error: reason, attempt: repairAttempt, exitCode: result.code, timedOut: result.timedOut })) : reason });
+      } catch (persistError) { log(`[router] failed to persist run ${runId}: ${persistError.message}`); }
+    }
+  } finally {
+    if (leaseId) { try { state.releaseLease(db, leaseId); } catch (e) { log(`[router] failed to release lease ${leaseId}: ${e.message}`); } }
+    if (runStateDir) { try { rmSync(runStateDir, { recursive: true, force: true }); } catch (e) { log(`[router] failed to remove run state ${runStateDir}: ${e.message}`); } }
+    if (runHome) { try { rmSync(runHome, { recursive: true, force: true }); } catch (e) { log(`[router] failed to remove run home ${runHome}: ${e.message}`); } }
   }
 
   return { ok: outcomeOk, taskId, runId, worktree, attempt, repairAttempt, repairAction: repairAction?.action ?? null, output: (result.stderr || result.stdout || '').slice(0, 500) };

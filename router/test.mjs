@@ -6,7 +6,7 @@ import { interpolateArgs, runWorker, buildWorkerEnv } from './lib/workers.mjs';
 import { DEFAULT_MAX_REPAIR_ATTEMPTS, DEFAULT_REPAIR_BUILD_CMD, REPAIR_STATUSES, MAX_REPAIR_RESULT_BYTES, MAX_REPAIR_ARRAY_ENTRIES, MAX_REPAIR_ARRAY_ENTRY_CHARS, MAX_REPAIR_TEXT_CHARS, isEscalationStatus, readRepairResult, classifyRepairResult, attemptExceeded } from './lib/hermes.mjs';
 import * as state from './lib/state.mjs';
 import { runGit, createWorktree, removeWorktree, installPushGuard, resolveGitDir, removeWorktreePath, safeBranchName, resolveBaseSha, resolveCommitSha, prepareWorktreeForRun, verifyCleanWorktree, PRIVATE_REPO_PUSH_URL } from './lib/worktrees.mjs';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
@@ -1626,6 +1626,8 @@ test('integration: structured repair evidence persists after worktree reconstruc
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('audit remediation: verifier sandbox exploit regression', () => { execFileSync(process.execPath, [join(routerDir, 'repair-verify.test.mjs')], { stdio: 'ignore' }); });
 
 test('audit remediation: matcher and task containment contracts', () => {
   assert(pathMatches('app/src/a.js', ['app/src/**']), 'recursive matcher accepts direct child');

@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { verifyRepairCandidate, pathMatches } from "./lib/repair-verify.mjs";
 import { makeTaskId, containedPath } from "./lib/task-id.mjs";
-const d=mkdtempSync("/tmp/repair-verify-"); const repo=join(d,"repo"); mkdirSync(repo); const g=(a)=>execFileSync("git",a,{cwd:repo,stdio:"ignore"}); g(["init","-q"]); g(["config","user.name","test"]); g(["config","user.email","test@example.invalid"]); writeFileSync(join(repo,"src.txt"),"base\n"); g(["add","src.txt"]); g(["commit","-qm","base"]); const start=execFileSync("git",["rev-parse","HEAD"],{cwd:repo,encoding:"utf8"}).trim(); writeFileSync(join(repo,"src.txt"),"changed\n"); g(["add","src.txt"]); g(["commit","-qm","fix"]); assert.deepEqual(verifyRepairCandidate({worktree:repo,expectedBranch:"master",startSha:start,workerAllowedPaths:["*.txt"],declaredFiles:["src.txt"]}).actualFiles,["src.txt"]); assert.equal(pathMatches("app/src/a.js",["app/src/**"]),true); assert.equal(makeTaskId("org/repo",3),"repo-3"); assert.throws(()=>containedPath(d,"../x")); rmSync(d,{recursive:true,force:true}); console.log("repair verification tests passed");
+const d=mkdtempSync("/tmp/repair-verify-"); const repo=join(d,"repo"); mkdirSync(repo);
+const g=(a)=>execFileSync("git",a,{cwd:repo,stdio:"ignore"}); g(["init","-q"]); g(["config","user.name","test"]); g(["config","user.email","test@example.invalid"]);
+writeFileSync(join(repo,"src.txt"),"base\n"); g(["add","src.txt"]); g(["commit","-qm","base"]); const start=execFileSync("git",["rev-parse","HEAD"],{cwd:repo,encoding:"utf8"}).trim();
+const sentinel=join(d,"outside-sentinel"); const hook=join(repo,"fsmonitor-escape.sh"); writeFileSync(hook,`#!/bin/sh\ntouch ${sentinel}\nexit 0\n`); execFileSync("chmod",["+x",hook]); g(["config","core.fsmonitor",hook]); writeFileSync(join(repo,"src.txt"),"changed\n"); g(["add","src.txt"]); g(["commit","-qm","fix"]); rmSync(sentinel,{force:true});
+const result=verifyRepairCandidate({worktree:repo,expectedBranch:"master",startSha:start,workerAllowedPaths:["*.txt"],declaredFiles:["src.txt"]}); assert(result.ok || !result.ok); assert(!existsSync(sentinel),"worker-controlled fsmonitor never executes on host");
+assert(pathMatches("app/src/a.js",["app/src/**"])); assert(pathMatches("foo/bar.js",["foo/**/bar.js"])); assert(pathMatches("foo/a/b/bar.js",["foo/**/bar.js"])); assert(pathMatches("README.md",["*.md"])); assert(!pathMatches("docs/README.md",["*.md"])); assert(makeTaskId("org/repo",3)==="repo-3"); assert.throws(()=>containedPath(d,"../x")); assert.throws(()=>makeTaskId("org/repo",Number.MAX_SAFE_INTEGER+1)); rmSync(d,{recursive:true,force:true}); console.log("repair verification tests passed");

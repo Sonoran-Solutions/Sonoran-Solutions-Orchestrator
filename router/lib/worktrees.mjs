@@ -381,8 +381,9 @@ export function installPushGuard(worktreePath, { workerAllowedPaths = [], taskAl
 }
 
 // Remove a worktree by explicit source repo + path (used by the lease reaper).
-export function removeWorktreePath(sourceRepo, worktreePath, worktreeRoot = null) {
-  const root = resolve(worktreeRoot || join(worktreePath, '..'));
+export function removeWorktreePath(sourceRepo, worktreePath, worktreeRoot) {
+  if (!worktreeRoot) throw new Error('configured worktree root is required');
+  const root = resolve(worktreeRoot);
   const candidate = resolve(worktreePath);
   if (candidate === root || !candidate.startsWith(root + sep)) throw new Error('worktree path escapes configured root');
   if (!existsSync(candidate)) return;

@@ -21,7 +21,16 @@ WORKTREE="${SONORAN_WORKTREE:?SONORAN_WORKTREE is required}"
 JDK="/home/dq/.local/jdks/jdk-17.0.20.1+1"
 ANDROID_SDK="/home/dq/Android/Sdk"
 HERMES_CODE="/home/dq/.hermes/hermes-agent"
-SANDBOX_HOME="/home/dq/.hermes-sandbox/home"
+RUN_ID="${SONORAN_RUN_ID:?SONORAN_RUN_ID is required}"
+if ! [[ "$RUN_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]; then
+  echo "invalid SONORAN_RUN_ID" >&2; exit 64
+fi
+SANDBOX_HOME="/home/dq/.hermes-sandbox/runs/$RUN_ID/home"
+BASE_SKILL="/home/dq/.hermes-sandbox/base/skills/software-development/fix-build/SKILL.md"
+RUN_STATE_HOST="/home/dq/.local/state/sonoran-orchestrator/runs/$RUN_ID"
+[ -d "$RUN_STATE_HOST" ] || { echo "run-state directory is missing" >&2; exit 64; }
+[ -d "$SANDBOX_HOME" ] || { echo "per-run Hermes HOME is missing" >&2; exit 64; }
+[ -f "$BASE_SKILL" ] || { echo "immutable fix-build skill is missing" >&2; exit 64; }
 
 # /etc/resolv.conf is a symlink into /run on this host. /run is intentionally a
 # fresh tmpfs, so mount only the resolved file back at its target to make DNS work
@@ -31,6 +40,7 @@ DNS_MOUNTS=()
 if [ "$RESOLV_CONF" != "/etc/resolv.conf" ]; then
   DNS_MOUNTS=(--dir "$(dirname "$RESOLV_CONF")" --ro-bind "$RESOLV_CONF" "$RESOLV_CONF")
 fi
+RUN_MOUNTS=(--dir /run/sonoran --bind "$RUN_STATE_HOST" /run/sonoran)
 
 # Curated root: only the read-only toolchain root dirs are exposed, plus a
 # minimal /dev, a fresh /proc, and tmpfs for everything else. Bubblewrap always
@@ -40,7 +50,7 @@ fi
 # + the task-private checkout are mounted, so
 # ~/.git-credentials, ~/.ssh, ~/.config/sonoran, the orchestrator checkout, and
 # unrelated repos/worktrees are NOT visible.
-exec bwrap \
+bwrap_cmd=(bwrap \
   --ro-bind /usr /usr \
   --ro-bind /bin /bin \
   --ro-bind /sbin /sbin \
@@ -63,6 +73,12 @@ exec bwrap \
   --ro-bind "$HERMES_CODE" /opt/hermes-agent \
   --ro-bind /home/dq/.local/share/uv/python /home/dq/.local/share/uv/python \
   --bind "$SANDBOX_HOME" /home/hermes \
+  --dir /home/hermes/.hermes \
+  --dir /home/hermes/.hermes/skills \
+  --dir /home/hermes/.hermes/skills/software-development \
+  --dir /home/hermes/.hermes/skills/software-development/fix-build \
+  --ro-bind "$BASE_SKILL" /home/hermes/.hermes/skills/software-development/fix-build/SKILL.md \
+  "${RUN_MOUNTS[@]}" \
   --bind "$WORKTREE" "$WORKTREE" \
   --unshare-user \
   --unshare-ipc \
@@ -83,4 +99,11 @@ exec bwrap \
   --setenv SSH_ASKPASS /bin/false \
   --setenv GCM_INTERACTIVE Never \
   --setenv PATH "/opt/jdk17/bin:/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/android-sdk/cmake/3.22.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-  -- "$@"
+  -- "$@")
+
+# Filesystem-only deterministic tests may exercise mounts without invoking the
+# unresolved network wrapper. Production/default execution remains unchanged.
+if [ "${SONORAN_FILESYSTEM_TEST:-0}" = "1" ]; then exec "${bwrap_cmd[@]}"; fi
+# pasta provides a private user-mode network namespace with outbound DNS/HTTPS.
+# The worker remains in the private namespace; host loopback is not mapped into it.
+exec pasta -- "${bwrap_cmd[@]}"

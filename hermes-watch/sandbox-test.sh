@@ -15,6 +15,8 @@ SEED="$tmp/seed"
 SOURCE_REPO="$tmp/router-source"
 WORKTREE_ROOT="$tmp/task-checkouts"
 TASK_ID="hermes-git-runtime"
+RUN_ID="11111111-1111-4111-8111-111111111111"
+RUN_HOME_ROOT="/home/dq/.hermes-sandbox/runs/$RUN_ID/home"
 BRANCH="repair/runtime-smoke"
 WORKTREE="$WORKTREE_ROOT/$TASK_ID"
 HOST_SENTINEL="$tmp/unrelated-repo/secret.txt"
@@ -35,7 +37,8 @@ git --git-dir="$REMOTE" symbolic-ref HEAD refs/heads/main
 git clone --quiet "$REMOTE" "$SOURCE_REPO"
 START_SHA="$(git -C "$SOURCE_REPO" rev-parse HEAD)"
 
-mkdir -p "$WORKTREE_ROOT" "$(dirname "$HOST_SENTINEL")"
+mkdir -p "$WORKTREE_ROOT" "$(dirname "$HOST_SENTINEL")" "$RUN_HOME_ROOT"
+"$here/deploy-fix-build-skill.sh" >/dev/null
 printf 'TOP-SECRET\n' > "$HOST_SENTINEL"
 
 node --input-type=module - "$repo_root" "$SOURCE_REPO" "$WORKTREE_ROOT" "$TASK_ID" "$START_SHA" "$BRANCH" <<'NODE'
@@ -139,6 +142,7 @@ env -i \
   PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   HOME="/home/dq" \
   SONORAN_WORKTREE="$WORKTREE" \
+  SONORAN_RUN_ID="$RUN_ID" \
   "$here/sandbox-exec" /bin/bash "$fixture" "$HOST_SENTINEL" "$repo_root" "$START_SHA" "$BRANCH"
 
 # A sandbox-local commit must not create/update the task branch in the shared
