@@ -91,8 +91,10 @@ because it executes inside the sandbox; the sandbox is the security boundary.
 Hermes's effective HOME is a dedicated sandbox home, not the owner's HOME. Each
 task is a standalone private Git repository, so local Git operations do not need
 the hidden router source metadata. User/IPC/PID/UTS/cgroup namespaces are
-unshared; the network namespace is shared only for outbound DNS/HTTPS transport.
-Provider authentication remains deferred.
+unshared. `pasta` creates a separate worker network namespace, disables all port
+forwarding and host-gateway mapping, and a namespace-local immutable nftables
+policy rejects host loopback, RFC1918, CGNAT, and link-local destinations while
+allowing public DNS/HTTPS. Provider authentication remains deferred to M2.3.
 
 ## Attempt policy
 
@@ -140,9 +142,11 @@ Detailed logs belong in GitHub/task logs.
 | `triggers.md` | How Hermes should be awakened without bypassing task authorization/state. |
 | `INSTALL.md` | Install/version/config/upgrade, sandbox, skill deployment + smoke tests. |
 | `sandbox-exec` | The fixed OS filesystem sandbox (bubblewrap curated root). |
+| `network-policy` | Namespace-local nftables public-egress policy installed before Bubblewrap. |
 | `run-hermes-sandboxed` | Router-facing launcher that runs Hermes inside `sandbox-exec`. |
+| `run-repair-fixture-sandboxed` | Dev/test-only deterministic model replacement using the production sandbox. |
 | `deploy-fix-build-skill.sh` | Deploys the repo-controlled `fix-build` skill into the sandbox HOME. |
-| `sandbox-test.sh` | Deterministic runtime matrix: filesystem/proc denial, private Git + local commit, credential absence, DNS/HTTPS. |
+| `sandbox-test.sh` | Runtime matrix: filesystem/proc denial, private Git, network namespace/egress denial, DNS/HTTPS, lifecycle. |
 
 ## Accuracy note
 

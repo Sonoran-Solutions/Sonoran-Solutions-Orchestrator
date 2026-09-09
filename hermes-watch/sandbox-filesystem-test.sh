@@ -9,8 +9,7 @@ set -eu
 skill=/home/hermes/.hermes/skills/software-development/fix-build/SKILL.md
 [ -f "$skill" ] && grep -q '^name: fix-build$' "$skill"
 touch /home/hermes/.poison
-if printf 'poison
-' > "$skill" 2>/dev/null; then exit 21; fi
+if printf 'poison\n' 2>/dev/null > "$skill"; then exit 21; fi
 [ -d /run/sonoran ]
 PROBE
 chmod +x "$probe"

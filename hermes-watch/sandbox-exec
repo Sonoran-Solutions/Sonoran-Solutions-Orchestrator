@@ -21,6 +21,9 @@ WORKTREE="${SONORAN_WORKTREE:?SONORAN_WORKTREE is required}"
 JDK="/home/dq/.local/jdks/jdk-17.0.20.1+1"
 ANDROID_SDK="/home/dq/Android/Sdk"
 HERMES_CODE="/home/dq/.hermes/hermes-agent"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NETWORK_POLICY="$HERE/network-policy"
+RESOLVER_FILE="$HERE/resolv-public.conf"
 RUN_ID="${SONORAN_RUN_ID:?SONORAN_RUN_ID is required}"
 if ! [[ "$RUN_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]; then
   echo "invalid SONORAN_RUN_ID" >&2; exit 64
@@ -31,23 +34,28 @@ RUN_STATE_HOST="/home/dq/.local/state/sonoran-orchestrator/runs/$RUN_ID"
 [ -d "$RUN_STATE_HOST" ] || { echo "run-state directory is missing" >&2; exit 64; }
 [ -d "$SANDBOX_HOME" ] || { echo "per-run Hermes HOME is missing" >&2; exit 64; }
 [ -f "$BASE_SKILL" ] || { echo "immutable fix-build skill is missing" >&2; exit 64; }
+[ -x "$NETWORK_POLICY" ] || { echo "network policy launcher is missing" >&2; exit 64; }
+[ -f "$RESOLVER_FILE" ] || { echo "sandbox resolver configuration is missing" >&2; exit 64; }
 
 # /etc/resolv.conf is a symlink into /run on this host. /run is intentionally a
-# fresh tmpfs, so mount only the resolved file back at its target to make DNS work
-# without exposing the rest of host /run.
+# fresh tmpfs, so mount a fixed public-resolver file at the symlink target. This
+# exposes neither host systemd-resolved nor any private-LAN DNS service.
 RESOLV_CONF="$(readlink -f /etc/resolv.conf)"
 DNS_MOUNTS=()
 if [ "$RESOLV_CONF" != "/etc/resolv.conf" ]; then
-  DNS_MOUNTS=(--dir "$(dirname "$RESOLV_CONF")" --ro-bind "$RESOLV_CONF" "$RESOLV_CONF")
+  DNS_MOUNTS=(--dir "$(dirname "$RESOLV_CONF")" --ro-bind "$RESOLVER_FILE" "$RESOLV_CONF")
+else
+  DNS_MOUNTS=(--ro-bind "$RESOLVER_FILE" /etc/resolv.conf)
 fi
 RUN_MOUNTS=(--dir /run/sonoran --bind "$RUN_STATE_HOST" /run/sonoran)
 
 # Curated root: only the read-only toolchain root dirs are exposed, plus a
 # minimal /dev, a fresh /proc, and tmpfs for everything else. Bubblewrap always
 # creates a mount namespace; user/IPC/PID/UTS/cgroup namespaces are explicit below.
-# The network namespace is deliberately shared (no --unshare-net) so inference can
-# use outbound DNS/HTTPS. /home is tmpfs'd and then only the dedicated sandbox HOME
-# + the task-private checkout are mounted, so
+# pasta creates the outer private user/network namespace and network-policy installs
+# its egress filter before Bubblewrap creates a nested user namespace. Bubblewrap
+# intentionally inherits that already-isolated network namespace. /home is tmpfs'd
+# and then only the dedicated sandbox HOME + task-private checkout are mounted, so
 # ~/.git-credentials, ~/.ssh, ~/.config/sonoran, the orchestrator checkout, and
 # unrelated repos/worktrees are NOT visible.
 bwrap_cmd=(bwrap \
@@ -102,8 +110,17 @@ bwrap_cmd=(bwrap \
   -- "$@")
 
 # Filesystem-only deterministic tests may exercise mounts without invoking the
-# unresolved network wrapper. Production/default execution remains unchanged.
+# network wrapper. Production/default execution always uses the isolated path.
 if [ "${SONORAN_FILESYSTEM_TEST:-0}" = "1" ]; then exec "${bwrap_cmd[@]}"; fi
-# pasta provides a private user-mode network namespace with outbound DNS/HTTPS.
-# The worker remains in the private namespace; host loopback is not mapped into it.
-exec pasta -- "${bwrap_cmd[@]}"
+
+# Command mode makes pasta the lifecycle supervisor for the namespace and worker.
+# No host<->namespace port forwarding is enabled, host-gateway mapping is disabled,
+# and the nftables policy rejects loopback, link-local, CGNAT, and RFC1918 egress.
+# IPv4-only operation also prevents an unfiltered IPv6 path. The PID file permits
+# deterministic lifecycle assertions and is removed with this run-state directory.
+PASTA_PID_FILE="$RUN_STATE_HOST/network-helper.pid"
+[ ! -e "$PASTA_PID_FILE" ] || { echo "network helper state already exists" >&2; exit 64; }
+exec pasta --foreground --quiet --ipv4-only --config-net --no-map-gw \
+  --dns 1.1.1.1 --dns 1.0.0.1 \
+  --tcp-ports none --udp-ports none --tcp-ns none --udp-ns none \
+  --pid "$PASTA_PID_FILE" -- "$NETWORK_POLICY" "${bwrap_cmd[@]}"

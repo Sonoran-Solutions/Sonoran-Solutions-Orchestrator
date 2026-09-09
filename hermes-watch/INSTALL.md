@@ -49,7 +49,8 @@ The router does **not** launch `hermes` directly as the owner. It launches the
 fixed launcher `hermes-watch/run-hermes-sandboxed`, which runs the real Hermes
 binary inside `hermes-watch/sandbox-exec` — a Bubblewrap mount namespace with
 explicit user, IPC, PID, UTS, and cgroup isolation plus a curated root filesystem.
-The network namespace is deliberately shared for outbound inference transport.
+`pasta` command mode creates a separate outer user/network namespace, and a
+namespace-local nftables policy limits that namespace to public IPv4 egress.
 
 Effective sandbox view:
 
@@ -61,7 +62,9 @@ Effective sandbox view:
 | `/home/dq/.local/share/uv/python` | uv-managed Python | read-only |
 | `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc` | system toolchain (gcc, git, sh, certs) | read-only |
 | `/dev`, `/proc`, `/tmp`, `/var`, `/run`, `/home`, `/root` | fresh/minimal (no host content) | fresh |
-| `/home/hermes` | dedicated sandbox HOME (skills, provider config, caches) | read-write |
+| `/home/hermes` | router-created per-run HOME (`~/.hermes-sandbox/runs/<RUN_ID>/home`) | read-write |
+| `/home/hermes/.hermes/skills/software-development/fix-build/SKILL.md` | canonical base skill | read-only |
+| `/run/sonoran` | current run only (`~/.local/state/sonoran-orchestrator/runs/<RUN_ID>`) | read-write |
 | `$SONORAN_WORKTREE` | assigned task-private Git checkout, including private `.git` metadata | read-write |
 
 **Not visible:** `~/.git-credentials`, `~/.ssh`, `~/.config/sonoran`, the
@@ -96,20 +99,41 @@ commit work; remote publication does not.
 
 ### Namespace and network policy
 
-Bubblewrap always creates the mount namespace. The launcher explicitly unshares
-user, IPC, PID, UTS, and cgroup namespaces. It intentionally does not unshare the
-network namespace, and mounts only the resolved `/etc/resolv.conf` target back
-into the otherwise-fresh `/run`. This preserves the curated filesystem while
-enabling DNS and outbound HTTPS/TLS. Provider authentication is not configured
-or proven; any future provider key belongs only in the dedicated Hermes HOME and
-must be provider-specific, low-privilege, and budget/rate limited.
+Installed network component: Debian/Ubuntu package
+`passt 0.0~git20240220.1e6f92b-1` (`pasta --version` reports `unknown version`).
+The exact topology is:
+
+1. `pasta --foreground --config-net -4` creates and supervises a private outer
+   user/network namespace. All host-to-worker and worker-to-host port forwarding
+   is disabled (`-t none -u none -T none -U none`), and `--no-map-gw` disables
+   the host-gateway/loopback mapping.
+2. `network-policy` installs an nftables output filter inside that namespace.
+   It rejects `127.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`,
+   `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16`, `::1`, `fc00::/7`,
+   and `fe80::/10`. IPv4-only pasta operation prevents an alternate IPv6 egress
+   path.
+3. Bubblewrap inherits that network namespace, creates the curated mount/PID/
+   IPC/UTS/cgroup view, then creates a nested user namespace. Because the nested
+   worker user namespace does not own the outer network namespace, the worker
+   cannot flush or replace its nftables policy.
+4. A fixed read-only resolver file names public resolvers `1.1.1.1` and
+   `1.0.0.1`; no host resolver socket or broad host `/run` mount is exposed.
+
+`pasta` remains the foreground parent/supervisor and exits when the sandboxed
+worker exits or is killed. Its PID is recorded under the current run-state
+directory solely for lifecycle testing; router cleanup removes that directory.
+
+Provider authentication is not configured or proven. Any future provider key
+belongs only in the per-run Hermes HOME and must be provider-specific,
+low-privilege, and budget/rate limited. Provider authentication is deferred to
+M2.3.
 
 Prove the boundary and runtime behavior (no LLM call):
 
 ```bash
 bash hermes-watch/sandbox-test.sh
-# Git status/rev-parse/branch/diff/add/commit; credential absence;
-# literal sentinel + /proc denial; DNS + HTTPS transport
+# private namespace; localhost/LAN/link-local denial; DNS + HTTPS;
+# helper lifecycle; Git local commit; credentials, sentinel, and /proc denial
 ```
 
 ## Deploy + verify the fix-build skill (ORCH-097)
@@ -119,13 +143,14 @@ sandboxed Hermes HOME in the layout Hermes v0.21.1 resolves:
 
 ```bash
 bash hermes-watch/deploy-fix-build-skill.sh
-# deployed -> /home/dq/.hermes-sandbox/home/.hermes/skills/software-development/fix-build/SKILL.md
+# deployed -> /home/dq/.hermes-sandbox/base/skills/software-development/fix-build/SKILL.md
 ```
 
 Verify with the real installation (through the sandbox):
 
 ```bash
-WORKTREE=$(mktemp -d) SONORAN_WORKTREE="$WORKTREE" \
+RUN_ID=<router-generated-uuid> SONORAN_RUN_ID="$RUN_ID" \
+  SONORAN_WORKTREE=<router-private-checkout> \
   hermes-watch/run-hermes-sandboxed skills list | grep fix-build
 # │ fix-build │ software-development │ local │ local │ enabled │
 ```
@@ -136,10 +161,9 @@ to M2.3, not a skill-resolution gap.
 
 ## Notes
 
-- Hermes owns its sandbox config under `/home/dq/.hermes-sandbox/home/.hermes`
-  (including any provider/model credentials configured later via `hermes setup`
-  inside the sandbox). Those credentials are Hermes's own and are **not**
-  committed to the repository.
+- Hermes runtime config/cache belongs to the router-created per-run HOME. The
+  canonical fix-build skill is separately mounted read-only from
+  `/home/dq/.hermes-sandbox/base`; no shared writable Hermes HOME is restored.
 - Each task-private repository has the harmless repo-local identity
   `Sonoran Hermes Repair Worker <hermes@local>`. Global/system Git config is
   ignored inside the sandbox; there are no remote/owner credentials.
