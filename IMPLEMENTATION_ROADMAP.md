@@ -249,10 +249,16 @@ A signed, authorized test event can create **exactly one** durable task/run and 
 ## M2.2 — Hermes setup
 
 - [x] **ORCH-095** Install/configure Hermes on the self-hosted machine (`hermes-agent` v0.21.1, `~/.hermes`).
-- [x] **ORCH-096** Give Hermes only the task-private checkout and minimum required environment (structured `SONORAN_*` metadata + env allowlist); preserve mount/user/PID isolation while allowing outbound DNS/HTTPS transport.
+- [x] **ORCH-096** Give Hermes only the task-private checkout and minimum required environment (structured `SONORAN_*` metadata + env allowlist); use a supervised `pasta` private network namespace plus immutable nftables private-range denial while allowing public DNS/HTTPS transport.
 - [x] **ORCH-097** Update the fix-build skill to consume task/run/lease scope from the router (structured result file contract).
 - [x] **ORCH-098** Set a bounded repair limit (control-plane enforced `maxAttempts: 3`; attempt 4 refused).
 - [x] **ORCH-099** Require escalation for API/schema/product/security decisions (`escalate`/`blocked` stop the autonomous loop).
+
+Deterministic boundary fixture F-09 is complete: synthetic HTTP traverses the
+real router, production sandbox, external result channel, verifier, durable
+SQLite evidence, and cleanup. It replaces the model with a dev-gated fixed
+command and does not begin the real autonomous repairs in M2.3. ORCH-080 remains
+open; no candidate push occurs.
 
 ## M2.3 — Deliberate failure tests
 

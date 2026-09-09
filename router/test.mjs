@@ -16,12 +16,18 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pathMatches, verifyRepairCandidate } from './lib/repair-verify.mjs';
 import { makeTaskId, containedPath } from './lib/task-id.mjs';
+import { validateConfig } from './lib/config.mjs';
 
 const routerDir = dirname(fileURLToPath(import.meta.url));
 let passed = 0; let failed = 0;
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 function assert(cond, msg) { if (!cond) throw new Error(msg || 'assertion failed'); }
+function assertThrows(fn, pattern, msg) {
+  let error = null;
+  try { fn(); } catch (caught) { error = caught; }
+  assert(error && pattern.test(String(error.message || error)), msg || 'expected matching exception');
+}
 
 // git util that throws on non-zero exit, for expected-success assertions.
 function git(cwd, args) { return runGit(cwd, args); }
@@ -891,6 +897,21 @@ test('workers: repair env injects structured SONORAN_* metadata and never leaks 
   assert(!('GITHUB_WEBHOOK_SECRET' in out) && !('SLACK_WEBHOOK_URL' in out) && !('LANG' in out), 'router secrets + unlisted vars never inherited');
 });
 
+test('config: fixture gates and lease lifetime fail closed at startup', () => {
+  const worker = { createsTask: true, repair: true, timeoutMs: 20000, sandboxedTestFixture: true };
+  assertThrows(
+    () => validateConfig({ devMode: false, testFixtures: false, leaseDurationMs: 60000, workers: { hermes: worker } }),
+    /test fixtures require devMode=true and testFixtures=true/,
+    'production config rejects sandboxed fixture behavior',
+  );
+  assertThrows(
+    () => validateConfig({ devMode: true, testFixtures: true, leaseDurationMs: 32000, workers: { hermes: worker } }),
+    /leaseDurationMs must exceed worker timeout/,
+    'lease must exceed worker timeout plus kill grace and safety margin',
+  );
+  validateConfig({ devMode: true, testFixtures: true, leaseDurationMs: 60000, workers: { hermes: worker } });
+});
+
 // ---------------------------------------------------------------- integration (HTTP)
 async function httpRequest(port, { method = 'POST', path = '/', headers = {}, body } = {}) {
   return new Promise((resolve, reject) => {
@@ -960,6 +981,18 @@ test('integration: full control-plane flow', async () => {
     const r1 = await httpRequest(port, { headers: { 'X-GitHub-Event': 'pull_request', 'X-GitHub-Delivery': 'd-pr1', 'X-Hub-Signature-256': sign(SECRET, prUntrusted) }, body: prUntrusted });
     assert(r1.status === 403, 'untrusted actor rejected');
 
+    // A valid HMAC does not waive the production delivery-ID requirement. This
+    // rejection happens before recording/deduplication or worker dispatch.
+    const beforeMissing = new DatabaseSync(join(dir, 'state.sqlite'), { readOnly: true });
+    const deliveryCountBefore = beforeMissing.prepare('SELECT COUNT(*) AS n FROM deliveries').get().n;
+    beforeMissing.close();
+    const missingDelivery = await httpRequest(port, { headers: { 'X-GitHub-Event': 'pull_request', 'X-Hub-Signature-256': sign(SECRET, prUntrusted) }, body: prUntrusted });
+    assert(missingDelivery.status === 400 && missingDelivery.body.error === 'missing X-GitHub-Delivery', 'signed production request without delivery ID rejected');
+    const afterMissing = new DatabaseSync(join(dir, 'state.sqlite'), { readOnly: true });
+    const deliveryCountAfter = afterMissing.prepare('SELECT COUNT(*) AS n FROM deliveries').get().n;
+    afterMissing.close();
+    assert(deliveryCountAfter === deliveryCountBefore, 'missing delivery ID caused no delivery record or dispatch');
+
     // signed PR opened by trusted actor -> notify dispatch (DRY_RUN)
     const prTrusted = JSON.stringify({ action: 'opened', sender: { login: 'trusted-user' }, repository: { full_name: 'Sonoran-Solutions/dualdex' }, pull_request: { number: 7, title: 'Add profile', head: { ref: 'feat/7' } } });
     const r2 = await httpRequest(port, { headers: { 'X-GitHub-Event': 'pull_request', 'X-GitHub-Delivery': 'd-pr2', 'X-Hub-Signature-256': sign(SECRET, prTrusted) }, body: prTrusted });
@@ -976,6 +1009,38 @@ test('integration: full control-plane flow', async () => {
   } finally {
     child.kill('SIGTERM');
     await new Promise((r) => child.on('close', r));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('integration: missing delivery ID escape hatch exists only in explicit dev mode', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-dev-delivery-'));
+  const port = 8247;
+  const cfg = {
+    port, devMode: true, bodyLimitBytes: 65536, defaultTimeoutMs: 20000, maxConcurrency: 1,
+    githubSecretEnv: 'GITHUB_WEBHOOK_SECRET', slackWebhookEnv: 'SLACK_WEBHOOK_URL',
+    stateDb: join(dir, 'state.sqlite'), reposRoot: join(dir, 'repos'), worktreeRoot: join(dir, 'worktrees'),
+    reapIntervalMs: 0, leaseDurationMs: 86400000,
+    allowlist: ['trusted-user'], requireLabel: 'agent:ready',
+    workers: { fixture: { program: 'node', args: ['-e', 'process.exit(0)'], envAllowlist: ['PATH', 'HOME'] } },
+    rules: [{ id: 'dev-fixture', when: { events: ['issues'], actions: ['opened'] }, worker: 'fixture', authorize: 'trusted' }],
+  };
+  const configPath = join(dir, 'config.json');
+  writeFileSync(configPath, JSON.stringify(cfg));
+  const child = spawn('node', ['server.mjs'], {
+    cwd: routerDir,
+    env: { ...process.env, CONFIG_PATH: configPath, GITHUB_WEBHOOK_SECRET: '', SLACK_WEBHOOK_URL: '' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.stderr.on('data', () => {});
+  try {
+    await waitFor(() => httpRequest(port, { method: 'GET', path: '/health' }).then((r) => r.status === 200), 4000);
+    const body = JSON.stringify({ action: 'opened', sender: { login: 'trusted-user' }, repository: { full_name: 'r/r' }, issue: { number: 1, title: 'dev', body: '' } });
+    const response = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues' }, body });
+    assert(response.status === 200 && response.body.ok === true, `explicit dev request without delivery ID processed: ${JSON.stringify(response.body)}`);
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise((resolve) => child.on('close', resolve));
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -1376,6 +1441,19 @@ function hermesIssueBody(repoSlug, baseSha, state, delivery) {
   });
 }
 
+function hermesLabeledBody(repoSlug, baseSha, state, { actor = 'trusted-user', label = 'agent:ready' } = {}) {
+  return JSON.stringify({
+    action: 'labeled', sender: { login: actor }, repository: { full_name: repoSlug },
+    label: { name: label },
+    issue: {
+      number: 40,
+      title: 'Repair',
+      body: hermesEnvelope(baseSha, state),
+      labels: [{ name: 'agent:ready' }, ...(label === 'agent:ready' ? [] : [{ name: label }])],
+    },
+  });
+}
+
 test('integration: hermes repair receives the worktree + full structured context, never router secrets', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'sonoran-hermes-ctx-'));
   const port = 8251;
@@ -1414,6 +1492,9 @@ test('integration: hermes attempt limit allows 1..3 and refuses attempt 4 withou
     const body4 = hermesIssueBody(repoSlug, baseSha, 'in_progress', 'd-hatt-4');
     const res4 = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-hatt-4', 'X-Hub-Signature-256': sign('test-secret', body4) }, body: body4 });
     assert(res4.status === 422 && res4.body.refusal === true && /attempt limit reached/.test(res4.body.reason), `attempt 4 refused: ${JSON.stringify(res4.body)}`);
+    const retryBody = hermesLabeledBody(repoSlug, baseSha, 'escalated', { label: 'repair:retry' });
+    const retry = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-hatt-retry', 'X-Hub-Signature-256': sign('test-secret', retryBody) }, body: retryBody });
+    assert(retry.status === 422 && retry.body.refusal === true && /attempt limit reached/.test(retry.body.reason), `trusted repair:retry cannot create attempt 4: ${JSON.stringify(retry.body)}`);
     const rdb = new DatabaseSync(join(dir, 'state.sqlite'), { readOnly: true });
     const runs = rdb.prepare('SELECT * FROM runs WHERE task_id = ?').all('dualdex-40');
     rdb.close();
@@ -1461,6 +1542,57 @@ test('integration: hermes blocked result (invalid worktree/lease) refuses furthe
     assert(res2.status === 422 && /blocked/.test(res2.body.reason), `blocked task refuses further repair: ${JSON.stringify(res2.body)}`);
   } finally {
     child.kill('SIGTERM'); await new Promise((r) => child.on('close', r)); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('integration: repair:retry requires a trusted current event and matching terminal state', async () => {
+  const escalatedDir = mkdtempSync(join(tmpdir(), 'sonoran-hermes-reauth-escalated-'));
+  const escalatedFixture = writeFakeHermes(escalatedDir, { result: { status: 'escalate', escalation_reason: 'human decision required' } });
+  const escalatedRouter = await startHermesRouter(escalatedDir, 8271, { program: 'node', args: [escalatedFixture], repair: true, maxAttempts: 3, allowedPaths: ['app/src/**'], envAllowlist: ['PATH', 'HOME'] });
+  try {
+    const firstBody = hermesLabeledBody(escalatedRouter.repoSlug, escalatedRouter.baseSha, 'planned');
+    const first = await httpRequest(8271, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-reauth-escalate', 'X-Hub-Signature-256': sign('test-secret', firstBody) }, body: firstBody });
+    assert(first.status === 200 && first.body.repairAction === 'escalate', 'fixture established persisted escalated state');
+
+    const ordinaryBody = hermesLabeledBody(escalatedRouter.repoSlug, escalatedRouter.baseSha, 'escalated');
+    const ordinary = await httpRequest(8271, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-reauth-ordinary', 'X-Hub-Signature-256': sign('test-secret', ordinaryBody) }, body: ordinaryBody });
+    assert(ordinary.status === 422 && /human re-authorization/.test(ordinary.body.reason), `ordinary automatic event refused: ${JSON.stringify(ordinary.body)}`);
+
+    const untrustedBody = hermesLabeledBody(escalatedRouter.repoSlug, escalatedRouter.baseSha, 'escalated', { actor: 'mallory', label: 'repair:retry' });
+    const untrusted = await httpRequest(8271, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-reauth-untrusted', 'X-Hub-Signature-256': sign('test-secret', untrustedBody) }, body: untrustedBody });
+    assert(untrusted.status === 403 && untrusted.body.authorized === false, 'untrusted repair:retry actor refused');
+
+    const mismatchBody = hermesLabeledBody(escalatedRouter.repoSlug, escalatedRouter.baseSha, 'blocked', { label: 'repair:retry' });
+    const mismatch = await httpRequest(8271, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-reauth-mismatch', 'X-Hub-Signature-256': sign('test-secret', mismatchBody) }, body: mismatchBody });
+    assert(mismatch.status === 422 && /does not match persisted/.test(JSON.stringify(mismatch.body)), 'persisted/envelope mismatch refused');
+
+    const trustedBody = hermesLabeledBody(escalatedRouter.repoSlug, escalatedRouter.baseSha, 'escalated', { label: 'repair:retry' });
+    const trusted = await httpRequest(8271, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-reauth-trusted', 'X-Hub-Signature-256': sign('test-secret', trustedBody) }, body: trustedBody });
+    assert(trusted.status === 200 && trusted.body.ok === true && trusted.body.repairAttempt === 2, `trusted matching repair:retry allowed: ${JSON.stringify(trusted.body)}`);
+    const db = new DatabaseSync(join(escalatedDir, 'state.sqlite'), { readOnly: true });
+    const runs = db.prepare('SELECT * FROM runs WHERE task_id = ?').all('dualdex-40');
+    db.close();
+    assert(runs.length === 2, `only initial + trusted retry launched (got ${runs.length})`);
+  } finally {
+    escalatedRouter.child.kill('SIGTERM');
+    await new Promise((resolve) => escalatedRouter.child.on('close', resolve));
+    rmSync(escalatedDir, { recursive: true, force: true });
+  }
+
+  const blockedDir = mkdtempSync(join(tmpdir(), 'sonoran-hermes-reauth-blocked-'));
+  const blockedFixture = writeFakeHermes(blockedDir, { result: { status: 'blocked', escalation_reason: 'human input required' } });
+  const blockedRouter = await startHermesRouter(blockedDir, 8272, { program: 'node', args: [blockedFixture], repair: true, maxAttempts: 3, allowedPaths: ['app/src/**'], envAllowlist: ['PATH', 'HOME'] });
+  try {
+    const firstBody = hermesLabeledBody(blockedRouter.repoSlug, blockedRouter.baseSha, 'planned');
+    const first = await httpRequest(8272, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-reauth-blocked', 'X-Hub-Signature-256': sign('test-secret', firstBody) }, body: firstBody });
+    assert(first.status === 200 && first.body.repairAction === 'blocked', 'fixture established persisted blocked state');
+    const retryBody = hermesLabeledBody(blockedRouter.repoSlug, blockedRouter.baseSha, 'blocked', { label: 'repair:retry' });
+    const retry = await httpRequest(8272, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-reauth-blocked-retry', 'X-Hub-Signature-256': sign('test-secret', retryBody) }, body: retryBody });
+    assert(retry.status === 200 && retry.body.ok === true && retry.body.repairAttempt === 2, `trusted blocked repair:retry allowed: ${JSON.stringify(retry.body)}`);
+  } finally {
+    blockedRouter.child.kill('SIGTERM');
+    await new Promise((resolve) => blockedRouter.child.on('close', resolve));
+    rmSync(blockedDir, { recursive: true, force: true });
   }
 });
 
@@ -1628,6 +1760,10 @@ test('integration: structured repair evidence persists after worktree reconstruc
 });
 
 test('audit remediation: verifier sandbox exploit regression', () => { execFileSync(process.execPath, [join(routerDir, 'repair-verify.test.mjs')], { stdio: 'ignore' }); });
+
+test('integration: real router -> production sandbox -> verifier boundary (F-09)', () => {
+  execFileSync(process.execPath, [join(routerDir, 'real-sandbox-fixture.test.mjs')], { stdio: 'inherit' });
+});
 
 test('audit remediation: matcher and task containment contracts', () => {
   assert(pathMatches('app/src/a.js', ['app/src/**']), 'recursive matcher accepts direct child');

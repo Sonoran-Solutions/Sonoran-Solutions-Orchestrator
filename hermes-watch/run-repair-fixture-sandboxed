@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Test-only deterministic replacement for the Hermes model process. The router
+# may invoke this launcher only behind devMode=true + testFixtures=true. It uses
+# the exact production sandbox-exec boundary and never contacts a model provider.
+set -euo pipefail
+
+[ "${SONORAN_TEST_FIXTURE:-}" = "sandboxed" ] || {
+  echo "sandboxed repair fixture is not enabled by the router" >&2
+  exit 64
+}
+
+mode="${1:?fixture mode is required}"
+case "$mode" in
+  allowed|unauthorized) ;;
+  *) echo "unknown fixture mode" >&2; exit 64 ;;
+esac
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+exec "$here/sandbox-exec" /bin/bash -c '
+set -euo pipefail
+mode="$1"
+
+[ "$HOME" = /home/hermes ]
+[ "$HERMES_HOME" = /home/hermes/.hermes ]
+[ "$SONORAN_RESULT_FILE" = /run/sonoran/repair-result.json ]
+[[ "$SONORAN_RUN_ID" =~ ^[0-9a-fA-F-]{36}$ ]]
+[ -n "$SONORAN_TASK_ID" ]
+[ -n "$SONORAN_LEASE_ID" ]
+[ -n "$SONORAN_BASE_SHA" ]
+[ -n "$SONORAN_BRANCH" ]
+[ -n "$SONORAN_ATTEMPT" ]
+[ -d "$SONORAN_WORKTREE/.git" ]
+[ -r /home/hermes/.hermes/skills/software-development/fix-build/SKILL.md ]
+
+case "$mode" in
+  allowed)
+    target=app/src/import/fixture-fix.txt
+    mkdir -p "$(dirname "$target")"
+    printf "deterministic sandbox repair\n" > "$target"
+    ;;
+  unauthorized)
+    target=unauthorized/fixture-escape.txt
+    mkdir -p "$(dirname "$target")"
+    printf "worker-declared success outside scope\n" > "$target"
+    ;;
+esac
+
+git add -- "$target"
+git commit --quiet -m "deterministic repair fixture ($mode)"
+head="$(git rev-parse HEAD)"
+printf "{\"status\":\"candidate_fix\",\"attempt\":%s,\"files_changed\":[\"%s\"],\"commands_executed\":[\"deterministic fixture\"],\"summary\":\"fixture commit %s\"}\n" \
+  "$SONORAN_ATTEMPT" "$target" "$head" > "$SONORAN_RESULT_FILE"
+printf "REAL_SANDBOX_FIXTURE mode=%s home=%s result=%s netns=%s\n" \
+  "$mode" "$HOME" "$SONORAN_RESULT_FILE" "$(readlink /proc/self/ns/net)"
+' sonoran-repair-fixture "$mode"

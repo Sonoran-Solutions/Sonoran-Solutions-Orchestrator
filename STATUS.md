@@ -21,13 +21,17 @@ deliberate repair and M2.4 merge policy remain intentionally untouched.
 - **ORCH-096** — REAL OS/filesystem sandbox via `hermes-watch/sandbox-exec`
   (Bubblewrap curated root): assigned task-private checkout RW + dedicated sandbox
   HOME (`/home/hermes`) + read-only toolchain. Mount/user/IPC/PID/UTS/cgroup
-  isolation remains explicit; the network namespace is shared for outbound
-  inference transport, with only the resolved DNS file restored into fresh `/run`.
+  isolation remains explicit. Foreground `pasta` command mode creates a private
+  outer user/network namespace with all port forwarding disabled and
+  `--no-map-gw`; namespace-local nftables rejects host loopback, RFC1918, CGNAT,
+  and link-local egress while fixed public DNS + outbound HTTPS remain available.
+  Bubblewrap's nested worker user namespace cannot modify that network policy.
   Host `~/.git-credentials`, `~/.ssh`, `~/.config/sonoran`, the orchestrator
   checkout, unrelated sentinels, and `/proc/1/root` escape paths are inaccessible.
   `--yolo` is only used inside this boundary.
 - **ORCH-097** — fix-build skill deployed from the repo source
-  (`hermes-watch/deploy-fix-build-skill.sh`) into the sandbox Hermes HOME; the
+  (`hermes-watch/deploy-fix-build-skill.sh`) into the immutable sandbox base and
+  mounted read-only into each router-created per-run Hermes HOME; the
   REAL Hermes (through the sandbox) lists `fix-build | software-development |
   local | local | enabled`; the skill consumes `SONORAN_*` context and writes a
   structured result. Provider authentication remains deferred to M2.3.
@@ -43,11 +47,18 @@ deliberate repair and M2.4 merge policy remain intentionally untouched.
   and evidence strings at 16,384 characters. Missing, malformed, oversized,
   mismatched, or shape-invalid evidence plus process exit 0 still records a failed
   attempt. Valid evidence survives checkout reconstruction + SQLite reopen.
-- **Tests** — router suite is `58 passed, 0 failed` (private Git metadata,
+- **F-09 boundary fixture** — `router/real-sandbox-fixture.test.mjs` crosses the
+  real synthetic HTTP → router authorization/reservation → private checkout →
+  production sandbox → external result → verifier → SQLite → cleanup path. An
+  allowed committed candidate succeeds; a worker-declared candidate that commits
+  an unauthorized path is rejected. This uses no LLM and is not an M2.3 repair.
+- **Tests** — router suite is `64 passed, 0 failed` (private Git metadata,
   repair-specific attempt accounting, bounded/mismatched result rejection,
-  fail-closed exit-0 integration, durable evidence), plus
+  trusted current-event `repair:retry`, production delivery IDs, F-09, durable
+  evidence), plus
   `hermes-watch/sandbox-test.sh` (filesystem/proc denials, real sandbox Git local
-  commit, publication credential absence, DNS, and outbound HTTPS).
+  commit, publication credential absence, private-network denial, DNS, outbound
+  HTTPS, and helper lifecycle).
 
 ## Done (earlier sessions)
 

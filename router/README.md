@@ -46,7 +46,7 @@ router/
 | Exactly one active lease per task; stale lease never reaps an owned worktree | ✅ |
 | Worker env hygiene: allowlist-only environment (no router-secret leakage) | ✅ |
 | Hermes bounded repair worker: structured `SONORAN_*` context, bounded structured result file, attempt limit, escalation terminal | ✅ |
-| Tests: 58 passing (`node test.mjs`) + full runtime `hermes-watch/sandbox-test.sh` | ✅ |
+| Tests: 64 passing (`node test.mjs`) + full runtime `hermes-watch/sandbox-test.sh` | ✅ |
 
 A random public issue/PR **cannot** launch a worker: it needs a valid signature,
 an untrusted actor is rejected, a code-editing dispatch additionally needs a
@@ -132,7 +132,9 @@ code worker, so it always gets an envelope + worktree + lease). It additionally:
   `../hermes-watch/run-hermes-sandboxed`, not the raw `hermes` binary), so it
   gets a curated filesystem (assigned private checkout RW + dedicated sandbox
   HOME + a read-only toolchain; no owner credentials/SSH/Sonoran config), explicit
-  user/IPC/PID/UTS/cgroup namespaces, and shared networking for DNS/HTTPS;
+  user/IPC/PID/UTS/cgroup namespaces, plus a `pasta`-created private network
+  namespace whose immutable nftables policy denies host loopback, RFC1918,
+  CGNAT, and link-local destinations while allowing public DNS/HTTPS;
 - receives structured `SONORAN_*` context instead of a free-form prompt: task/run/
   lease IDs, repo, branch, base SHA, REPAIR attempt/max-attempts, allowed/task
   paths, canonical build command, and `SONORAN_RESULT_FILE`;
@@ -164,8 +166,25 @@ code worker, so it always gets an envelope + worktree + lease). It additionally:
 The router interprets + persists the structured result; free-form worker prose
 never mutates router state. A process exit 0 plus missing/malformed/oversized/
 mismatched evidence is still a failed repair attempt. Env allowlisting (router),
-filesystem sandboxing (launcher), and shared outbound network transport are
-separate explicit boundaries; provider authentication remains deferred.
+filesystem sandboxing (launcher), and isolated outbound network transport are
+separate explicit boundaries. Network transport is provided by foreground
+`pasta` command mode with every port-forwarding direction disabled,
+`--no-map-gw`, IPv4-only operation, fixed public DNS, and an in-namespace
+nftables private-range deny policy. Provider authentication remains deferred to
+M2.3.
+
+### Real sandbox fixture (F-09)
+
+`node real-sandbox-fixture.test.mjs` sends a synthetic HTTP delivery through the
+real router reservation path, task-private Git checkout, production
+`sandbox-exec`, external `/run/sonoran/repair-result.json` channel, router-owned
+verifier sandbox, durable SQLite evidence, and cleanup finalizer. Its positive
+case commits one allowed path and is accepted; its negative case commits an
+unauthorized path while claiming `candidate_fix` and is rejected by the router.
+The deterministic model replacement is available only when both `devMode` and
+`testFixtures` are true and the worker declares `sandboxedTestFixture`; startup
+validation rejects that worker flag in production configuration. No model or
+provider credential is used.
 
 ### Allowed-path policy (two scopes, never widening)
 
@@ -173,9 +192,9 @@ Path scope is two independent scopes, both enforced per changed file by the
 cooperative pre-push guard:
 
 - **worker/repository baseline** = the worker's `allowedPaths` (the REQUIRED MAXIMUM
-  trusted boundary). Always written to `.sonoran-worker-allowed-paths`.
+  trusted boundary). Stored under the private repository's `.git/sonoran` metadata.
 - **task scope** = the envelope's `allowed_paths` (an OPTIONAL additional narrowing
-  boundary). Written to `.sonoran-task-allowed-paths` **only when non-empty**;
+  boundary). Stored alongside it **only when non-empty**;
   omitted task scope means worker-baseline-only, NOT deny-all.
 
 A file must match BOTH when a task scope exists. A task `allowed_paths` of `*` can
