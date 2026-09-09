@@ -3,9 +3,9 @@ import { parseEnvelope, legalTransition, validateEnvelopeContext, pathScopes, va
 import { authorize } from './lib/auth.mjs';
 import { normalize } from './lib/events.mjs';
 import { interpolateArgs, runWorker, buildWorkerEnv } from './lib/workers.mjs';
-import { DEFAULT_MAX_REPAIR_ATTEMPTS, DEFAULT_REPAIR_BUILD_CMD, REPAIR_STATUSES, isEscalationStatus, readRepairResult, classifyRepairResult, attemptExceeded } from './lib/hermes.mjs';
+import { DEFAULT_MAX_REPAIR_ATTEMPTS, DEFAULT_REPAIR_BUILD_CMD, REPAIR_STATUSES, MAX_REPAIR_RESULT_BYTES, MAX_REPAIR_ARRAY_ENTRIES, MAX_REPAIR_ARRAY_ENTRY_CHARS, MAX_REPAIR_TEXT_CHARS, isEscalationStatus, readRepairResult, classifyRepairResult, attemptExceeded } from './lib/hermes.mjs';
 import * as state from './lib/state.mjs';
-import { runGit, createWorktree, removeWorktree, installPushGuard, resolveGitDir, removeWorktreePath, safeBranchName, resolveBaseSha, resolveCommitSha, prepareWorktreeForRun, verifyCleanWorktree } from './lib/worktrees.mjs';
+import { runGit, createWorktree, removeWorktree, installPushGuard, resolveGitDir, removeWorktreePath, safeBranchName, resolveBaseSha, resolveCommitSha, prepareWorktreeForRun, verifyCleanWorktree, PRIVATE_REPO_PUSH_URL } from './lib/worktrees.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import http from 'node:http';
@@ -331,19 +331,37 @@ test('state: activeExecutionState distinguishes a live execution from a stale on
 });
 
 // ---------------------------------------------------------------- worktrees
-test('worktrees: create + remove an isolated worktree on a named branch', () => {
+test('worktrees: create + remove an isolated task-private repository on a named branch', () => {
   const dir = mkdtempSync(join(tmpdir(), 'sonoran-wt-'));
+  const { src, baseSha } = makeRemoteRepo(dir);
+  const wtRoot = join(dir, 'worktrees');
+  const wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'task-1', baseSha, branch: 'feat/1' });
+  assert(wt.endsWith('task-1'), 'checkout path');
+  assert(existsSync(join(wt, '.git')) && resolveGitDir(wt) === join(wt, '.git'), 'task owns a standalone .git directory');
+  assert(!existsSync(join(wt, '.git', 'objects', 'info', 'alternates')), 'task repository has no shared-object alternate');
+  assert(!runGit(src, ['worktree', 'list']).includes('task-1'), 'source repository has no linked task worktree');
+  assert(runGit(wt, ['rev-parse', 'HEAD']).trim() === baseSha, 'private checkout starts at approved SHA');
+  assert(runGit(wt, ['rev-parse', '--abbrev-ref', 'HEAD']).trim() === 'feat/1', 'named task branch created');
+  assert(runGit(wt, ['config', '--local', 'user.email']).trim() === 'hermes@local', 'harmless local commit identity configured');
+  assert(runGit(wt, ['remote', 'get-url', '--push', 'origin']).trim() === PRIVATE_REPO_PUSH_URL, 'remote publication disabled');
+  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'task-1' });
+  assert(!existsSync(wt), 'private checkout removed');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('worktrees: task-private origin never copies embedded source credentials', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-wt-credentials-'));
   const src = join(dir, 'repo'); const wtRoot = join(dir, 'worktrees');
   mkdirSync(src); runGit(src, ['init', '-q']); runGit(src, ['config', 'user.email', 't@t']); runGit(src, ['config', 'user.name', 't']);
   writeFileSync(join(src, 'f.txt'), 'hello'); runGit(src, ['add', 'f.txt']); runGit(src, ['commit', '-qm', 'init']);
-  const sha = runGit(src, ['rev-parse', 'HEAD']).trim();
-  const wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'task-1', baseSha: sha, branch: 'feat/1' });
-  assert(wt.endsWith('task-1'), 'worktree path');
-  assert(runGit(src, ['worktree', 'list']).includes('task-1'), 'worktree listed');
-  const br = runGit(wt, ['rev-parse', '--abbrev-ref', 'HEAD']).trim();
-  assert(br === 'feat/1', `named task branch created (got ${br})`);
-  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'task-1' });
-  assert(!runGit(src, ['worktree', 'list']).includes('task-1'), 'worktree removed');
+  runGit(src, ['remote', 'add', 'origin', 'https://owner:TOPSECRET@github.com/example/repo.git']);
+  const baseSha = runGit(src, ['rev-parse', 'HEAD']).trim();
+  const wt = createWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'task-credentials', baseSha, branch: 'feat/credentials' });
+  const config = readFileSync(join(wt, '.git', 'config'), 'utf8');
+  assert(!config.includes('TOPSECRET') && !config.includes('owner@'), 'embedded source credentials stripped');
+  assert(runGit(wt, ['remote', 'get-url', 'origin']).trim() === 'https://github.com/example/repo.git', 'credential-free fetch URL retained');
+  assert(runGit(wt, ['remote', 'get-url', '--push', 'origin']).trim() === PRIVATE_REPO_PUSH_URL, 'push remains disabled');
+  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 'task-credentials' });
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -597,6 +615,20 @@ test('worktrees: retry never inherits a dirty prior worktree (fresh clean state)
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('worktrees: retry reconstructs a private checkout even if the worker deletes .git', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-retry-gitdir-'));
+  const { src, baseSha } = makeRemoteRepo(dir);
+  const wtRoot = join(dir, 'worktrees');
+  const first = prepareWorktreeForRun({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha, branch: 'feat/25' });
+  rmSync(join(first.path, '.git'), { recursive: true, force: true });
+  writeFileSync(join(first.path, 'dirt.txt'), 'dirt');
+  const second = prepareWorktreeForRun({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha, branch: 'feat/25' });
+  assert(runGit(second.path, ['rev-parse', 'HEAD']).trim() === baseSha, 'approved HEAD reconstructed');
+  assert(!existsSync(join(second.path, 'dirt.txt')) && existsSync(join(second.path, '.git')), 'damaged checkout fully replaced');
+  removeWorktree({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1' });
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test('worktrees: retry discards a local-only commit from a prior run (no auto promotion)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'sonoran-retry-local-'));
   const { src, baseSha } = makeRemoteRepo(dir);
@@ -649,11 +681,16 @@ test('worktrees: incompatible remote task branch fails closed (no auto rebase)',
   // Attempt 1 pushes the task branch to origin based on ABC.
   const p = prepareWorktreeForRun({ sourceRepo: src, worktreeRoot: wtRoot, taskId: 't1', baseSha, branch: 'feat/25' });
   runGit(p.path, ['commit', '--allow-empty', '-qm', 'candidate']);
+  // Publication is disabled in production checkouts; this test explicitly points
+  // the push URL at its temporary fixture remote to create authoritative state.
+  runGit(p.path, ['remote', 'set-url', '--push', 'origin', remoteDir]);
   runGit(p.path, ['push', '-q', '-u', 'origin', 'feat/25']);
 
   // Remote main advances to DEF; the task branch is based on ABC and is now stale.
   const newBase = advanceRemoteMain(remoteDir, dir);
   assert(newBase !== baseSha, 'remote main advanced');
+  const refreshed = resolveBaseSha(src, 'main');
+  assert(refreshed.ok && refreshed.sha === newBase, 'router source refreshed before checkout preparation');
 
   // Retry cannot safely reconcile: it must FAIL CLOSED rather than auto-rebase/merge.
   let threw = false;
@@ -743,6 +780,37 @@ test('hermes: readRepairResult validates a structured result and rejects malform
   assert(readRepairResult(notJson).ok === false, 'malformed JSON rejected');
 
   assert(readRepairResult(join(dir, 'missing.json')).ok === false, 'missing file rejected');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('hermes: repair result byte and field limits accept near-limit evidence and reject excess', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sonoran-hermes-limits-'));
+  const p = join(dir, 'result.json');
+
+  const nearLimit = {
+    status: 'no_fix', attempt: 1,
+    commands_executed: Array.from({ length: 30 }, (_, i) => String(i).padStart(3, '0') + ':' + 'x'.repeat(MAX_REPAIR_ARRAY_ENTRY_CHARS - 4)),
+  };
+  const nearRaw = JSON.stringify(nearLimit);
+  assert(Buffer.byteLength(nearRaw) > 60 * 1024 && Buffer.byteLength(nearRaw) <= MAX_REPAIR_RESULT_BYTES, 'fixture is valid and near byte ceiling');
+  writeFileSync(p, nearRaw);
+  assert(readRepairResult(p, { expectedAttempt: 1 }).ok === true, 'valid near-limit result accepted');
+
+  writeFileSync(p, 'x'.repeat(MAX_REPAIR_RESULT_BYTES + 1));
+  const oversized = readRepairResult(p, { expectedAttempt: 1 });
+  assert(!oversized.ok && /byte limit/.test(oversized.error) && !/JSON/.test(oversized.error), 'oversized file rejected before parse');
+
+  writeFileSync(p, JSON.stringify({ status: 'no_fix', attempt: 1, files_changed: Array(MAX_REPAIR_ARRAY_ENTRIES + 1).fill('f') }));
+  assert(!readRepairResult(p, { expectedAttempt: 1 }).ok, 'oversized array rejected');
+  writeFileSync(p, JSON.stringify({ status: 'no_fix', attempt: 1, files_changed: ['ok', 42] }));
+  assert(!readRepairResult(p, { expectedAttempt: 1 }).ok, 'non-string array element rejected');
+  writeFileSync(p, JSON.stringify({ status: 'no_fix', attempt: 1, commands_executed: ['x'.repeat(MAX_REPAIR_ARRAY_ENTRY_CHARS + 1)] }));
+  assert(!readRepairResult(p, { expectedAttempt: 1 }).ok, 'oversized array string rejected');
+  writeFileSync(p, JSON.stringify({ status: 'no_fix', attempt: 1, summary: 'x'.repeat(MAX_REPAIR_TEXT_CHARS + 1) }));
+  assert(!readRepairResult(p, { expectedAttempt: 1 }).ok, 'oversized evidence string rejected');
+  writeFileSync(p, JSON.stringify({ status: 'no_fix', attempt: 1, uncertainty: null }));
+  assert(!readRepairResult(p, { expectedAttempt: 1 }).ok, 'non-string evidence field rejected');
+
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -1209,8 +1277,9 @@ acceptance: |
 // ---------------------------------------------------------------- hermes repair integration (ORCH-096..099)
 // Build a FAKE Hermes executable (a node script, no live model/API) that dumps its
 // environment and writes a structured result file, so the plumbing is testable.
-function writeFakeHermes(dir, { result = null, exitCode = 0 } = {}) {
+function writeFakeHermes(dir, { result = null, rawResult = null, echoAttempt = true, exitCode = 0 } = {}) {
   const resultLiteral = result === null ? 'null' : JSON.stringify(result);
+  const rawResultLiteral = rawResult === null ? 'null' : JSON.stringify(rawResult);
   const fixture = `import { writeFileSync } from 'node:fs';
 const env = process.env;
 writeFileSync(${JSON.stringify(join(dir, 'env-dump.json'))}, JSON.stringify({
@@ -1230,10 +1299,13 @@ writeFileSync(${JSON.stringify(join(dir, 'env-dump.json'))}, JSON.stringify({
   hasWebhookSecret: ('GITHUB_WEBHOOK_SECRET' in env),
   hasSlack: ('SLACK_WEBHOOK_URL' in env),
 }));
+const rawResult = ${rawResultLiteral};
 const r = ${resultLiteral};
-if (r) {
-  // Echo the router-owned repair attempt (a well-behaved worker never redefines it).
-  if (env.SONORAN_ATTEMPT) r.attempt = Number(env.SONORAN_ATTEMPT);
+if (rawResult !== null && env.SONORAN_RESULT_FILE) {
+  writeFileSync(env.SONORAN_RESULT_FILE, rawResult);
+} else if (r) {
+  // Echo the router-owned repair attempt unless a negative test preserves a mismatch.
+  if (${echoAttempt} && env.SONORAN_ATTEMPT) r.attempt = Number(env.SONORAN_ATTEMPT);
   if (env.SONORAN_RESULT_FILE) writeFileSync(env.SONORAN_RESULT_FILE, JSON.stringify(r));
 }
 process.exit(${exitCode});
@@ -1407,6 +1479,37 @@ test('integration: hermes nonzero exit produces a durable failed run, never a fa
     assert(task.state === 'in_progress', `failed attempt stays retryable (got ${task.state})`);
   } finally {
     child.kill('SIGTERM'); await new Promise((r) => child.on('close', r)); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('integration: process exit 0 plus invalid repair evidence always fails closed', async () => {
+  const cases = [
+    { name: 'missing', options: { result: null, exitCode: 0 } },
+    { name: 'malformed', options: { rawResult: 'not json', exitCode: 0 } },
+    { name: 'oversized', options: { rawResult: 'x'.repeat(MAX_REPAIR_RESULT_BYTES + 1), exitCode: 0 } },
+    { name: 'mismatched', options: { result: { status: 'candidate_fix', attempt: 99 }, echoAttempt: false, exitCode: 0 } },
+  ];
+  for (let i = 0; i < cases.length; i++) {
+    const c = cases[i];
+    const dir = mkdtempSync(join(tmpdir(), 'sonoran-hermes-invalid-' + c.name + '-'));
+    const port = 8258 + i;
+    const fixture = writeFakeHermes(dir, c.options);
+    const { repoSlug, baseSha, child } = await startHermesRouter(dir, port, { program: 'node', args: [fixture], repair: true, maxAttempts: 3, allowedPaths: ['app/src/**'], envAllowlist: ['PATH', 'HOME'] });
+    try {
+      const body = hermesIssueBody(repoSlug, baseSha, 'planned', 'd-hinvalid-' + c.name);
+      const res = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-hinvalid-' + c.name, 'X-Hub-Signature-256': sign('test-secret', body) }, body });
+      assert(res.status === 200 && res.body.ok === false && res.body.repairAction === 'invalid', c.name + ' evidence must report invalid/non-ok: ' + JSON.stringify(res.body));
+      const rdb = new DatabaseSync(join(dir, 'state.sqlite'), { readOnly: true });
+      const run = rdb.prepare('SELECT status, result FROM runs WHERE task_id = ?').get('dualdex-40');
+      const task = rdb.prepare('SELECT state FROM tasks WHERE id = ?').get('dualdex-40');
+      rdb.close();
+      const record = JSON.parse(run.result);
+      assert(run.status === 'failed' && record.action === 'invalid' && record.error, c.name + ' evidence recorded as failed/invalid');
+      assert(task.state === 'in_progress', c.name + ' invalid attempt remains retryable');
+    } finally {
+      child.kill('SIGTERM'); await new Promise((r) => child.on('close', r));
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 });
 

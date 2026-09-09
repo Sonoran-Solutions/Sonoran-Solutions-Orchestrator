@@ -23,9 +23,21 @@ ANDROID_SDK="/home/dq/Android/Sdk"
 HERMES_CODE="/home/dq/.hermes/hermes-agent"
 SANDBOX_HOME="/home/dq/.hermes-sandbox/home"
 
+# /etc/resolv.conf is a symlink into /run on this host. /run is intentionally a
+# fresh tmpfs, so mount only the resolved file back at its target to make DNS work
+# without exposing the rest of host /run.
+RESOLV_CONF="$(readlink -f /etc/resolv.conf)"
+DNS_MOUNTS=()
+if [ "$RESOLV_CONF" != "/etc/resolv.conf" ]; then
+  DNS_MOUNTS=(--dir "$(dirname "$RESOLV_CONF")" --ro-bind "$RESOLV_CONF" "$RESOLV_CONF")
+fi
+
 # Curated root: only the read-only toolchain root dirs are exposed, plus a
-# minimal /dev, a fresh /proc, and tmpfs for everything else. /home is tmpfs'd
-# and then only the dedicated sandbox HOME + the worktree are mounted, so
+# minimal /dev, a fresh /proc, and tmpfs for everything else. Bubblewrap always
+# creates a mount namespace; user/IPC/PID/UTS/cgroup namespaces are explicit below.
+# The network namespace is deliberately shared (no --unshare-net) so inference can
+# use outbound DNS/HTTPS. /home is tmpfs'd and then only the dedicated sandbox HOME
+# + the task-private checkout are mounted, so
 # ~/.git-credentials, ~/.ssh, ~/.config/sonoran, the orchestrator checkout, and
 # unrelated repos/worktrees are NOT visible.
 exec bwrap \
@@ -45,13 +57,18 @@ exec bwrap \
   --tmpfs /media \
   --tmpfs /mnt \
   --tmpfs /srv \
+  "${DNS_MOUNTS[@]}" \
   --ro-bind "$JDK" /opt/jdk17 \
   --ro-bind "$ANDROID_SDK" /opt/android-sdk \
   --ro-bind "$HERMES_CODE" /opt/hermes-agent \
   --ro-bind /home/dq/.local/share/uv/python /home/dq/.local/share/uv/python \
   --bind "$SANDBOX_HOME" /home/hermes \
   --bind "$WORKTREE" "$WORKTREE" \
-  --unshare-all \
+  --unshare-user \
+  --unshare-ipc \
+  --unshare-pid \
+  --unshare-uts \
+  --unshare-cgroup \
   --die-with-parent \
   --chdir "$WORKTREE" \
   --setenv HOME /home/hermes \
@@ -59,5 +76,11 @@ exec bwrap \
   --setenv JAVA_HOME /opt/jdk17 \
   --setenv ANDROID_HOME /opt/android-sdk \
   --setenv ANDROID_SDK_ROOT /opt/android-sdk \
+  --setenv GIT_CONFIG_GLOBAL /dev/null \
+  --setenv GIT_CONFIG_SYSTEM /dev/null \
+  --setenv GIT_TERMINAL_PROMPT 0 \
+  --setenv GIT_ASKPASS /bin/false \
+  --setenv SSH_ASKPASS /bin/false \
+  --setenv GCM_INTERACTIVE Never \
   --setenv PATH "/opt/jdk17/bin:/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/android-sdk/cmake/3.22.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   -- "$@"

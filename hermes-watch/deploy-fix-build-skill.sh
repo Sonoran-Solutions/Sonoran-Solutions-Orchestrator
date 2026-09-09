@@ -20,21 +20,9 @@ mkdir -p "$(dirname "$dest")"
 cp "$source" "$dest"
 echo "deployed fix-build skill -> $dest"
 
-# A harmless dedicated git identity (no remote credentials) so a local candidate
-# commit works inside the sandbox.
-gitconfig="$SANDBOX_HOME/.gitconfig"
-if [ ! -f "$gitconfig" ]; then
-  mkdir -p "$SANDBOX_HOME"
-  cat > "$gitconfig" <<'EOF'
-[user]
-	name = Sonoran Hermes Repair Worker
-	email = hermes@local
-[credential]
-	helper =
-EOF
-  echo "wrote sandbox git identity -> $gitconfig"
-fi
-
+# Git identity is task-local in each router-created private repository. The
+# sandbox ignores global/system Git config, so this deployment never creates or
+# imports a credential helper.
 # Verify the deployed skill exists and has the expected frontmatter name.
 grep -q '^name: fix-build$' "$dest"
 echo "verified: deployed SKILL.md declares name 'fix-build'"

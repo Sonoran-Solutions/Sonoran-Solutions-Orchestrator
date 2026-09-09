@@ -7,10 +7,21 @@
 //
 // The router — not the worker — decides whether the autonomous repair loop
 // continues. `escalate` and `blocked` are terminal for the automatic loop.
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, lstatSync } from 'node:fs';
 
 export const REPAIR_STATUSES = ['candidate_fix', 'no_fix', 'escalate', 'blocked'];
 export const DEFAULT_MAX_REPAIR_ATTEMPTS = 3;
+
+// Worker-controlled result evidence is deliberately small and bounded before it
+// enters router memory. The byte limit is checked with lstat before readFileSync;
+// oversized files are rejected, never truncated and parsed.
+export const MAX_REPAIR_RESULT_BYTES = 64 * 1024;
+export const MAX_REPAIR_ARRAY_ENTRIES = 256;
+export const MAX_REPAIR_ARRAY_ENTRY_CHARS = 2048;
+export const MAX_REPAIR_TEXT_CHARS = 16 * 1024;
+
+const ARRAY_FIELDS = ['files_changed', 'commands_executed'];
+const TEXT_FIELDS = ['root_cause', 'summary', 'uncertainty', 'escalation_reason'];
 
 // The canonical local CI command a repair worker runs. Configurable per worker;
 // this is the DualDex canonical contract default.
@@ -28,6 +39,11 @@ export function isEscalationStatus(status) {
 export function readRepairResult(path, { expectedAttempt = null } = {}) {
   try {
     if (!path || !existsSync(path)) return { ok: false, error: 'no repair result file written' };
+    const file = lstatSync(path);
+    if (!file.isFile()) return { ok: false, error: 'repair result is not a regular file' };
+    if (file.size > MAX_REPAIR_RESULT_BYTES) {
+      return { ok: false, error: 'repair result exceeds ' + MAX_REPAIR_RESULT_BYTES + ' byte limit (got ' + file.size + ')' };
+    }
     const raw = readFileSync(path, 'utf8');
     const data = JSON.parse(raw);
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
@@ -46,11 +62,32 @@ export function readRepairResult(path, { expectedAttempt = null } = {}) {
     } else if (expectedAttempt != null) {
       return { ok: false, error: `result is missing the required attempt field (expected ${expectedAttempt})` };
     }
-    if (data.files_changed !== undefined && !Array.isArray(data.files_changed)) {
-      return { ok: false, error: 'files_changed must be an array when present' };
+    for (const field of ARRAY_FIELDS) {
+      if (data[field] === undefined) continue;
+      if (!Array.isArray(data[field])) {
+        return { ok: false, error: field + ' must be an array when present' };
+      }
+      if (data[field].length > MAX_REPAIR_ARRAY_ENTRIES) {
+        return { ok: false, error: field + ' exceeds ' + MAX_REPAIR_ARRAY_ENTRIES + ' entries' };
+      }
+      for (let i = 0; i < data[field].length; i++) {
+        const value = data[field][i];
+        if (typeof value !== 'string') {
+          return { ok: false, error: field + '[' + i + '] must be a string' };
+        }
+        if (value.length > MAX_REPAIR_ARRAY_ENTRY_CHARS) {
+          return { ok: false, error: field + '[' + i + '] exceeds ' + MAX_REPAIR_ARRAY_ENTRY_CHARS + ' characters' };
+        }
+      }
     }
-    if (data.commands_executed !== undefined && !Array.isArray(data.commands_executed)) {
-      return { ok: false, error: 'commands_executed must be an array when present' };
+    for (const field of TEXT_FIELDS) {
+      if (data[field] === undefined) continue;
+      if (typeof data[field] !== 'string') {
+        return { ok: false, error: field + ' must be a string when present' };
+      }
+      if (data[field].length > MAX_REPAIR_TEXT_CHARS) {
+        return { ok: false, error: field + ' exceeds ' + MAX_REPAIR_TEXT_CHARS + ' characters' };
+      }
     }
     return { ok: true, data };
   } catch (e) {

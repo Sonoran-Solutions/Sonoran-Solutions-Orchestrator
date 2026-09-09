@@ -64,7 +64,10 @@ local canonical CI command
         │
         ├─ regression ──▶ revert attempt
         │
-        └─ promising/green ──▶ commit + push candidate
+        └─ promising/green ──▶ local commit + structured evidence
+                                  │
+                                  ▼
+                     router-owned publication (deferred)
                                   │
                                   ▼
                            GitHub Actions
@@ -85,7 +88,11 @@ Hermes runs inside `sandbox-exec` (bubblewrap) with a curated root filesystem �
 see [INSTALL.md](INSTALL.md). Env allowlisting (router) and filesystem
 sandboxing (launcher) are **separate** boundaries. `--yolo` is only acceptable
 because it executes inside the sandbox; the sandbox is the security boundary.
-Hermes's effective HOME is a dedicated sandbox home, not the owner's HOME.
+Hermes's effective HOME is a dedicated sandbox home, not the owner's HOME. Each
+task is a standalone private Git repository, so local Git operations do not need
+the hidden router source metadata. User/IPC/PID/UTS/cgroup namespaces are
+unshared; the network namespace is shared only for outbound DNS/HTTPS transport.
+Provider authentication remains deferred.
 
 ## Attempt policy
 
@@ -104,8 +111,13 @@ Hermes writes a structured JSON result to `$SONORAN_RESULT_FILE` (status:
 `candidate_fix` / `no_fix` / `escalate` / `blocked`, plus evidence fields). The
 router validates it (including that the claimed `attempt` matches the
 router-owned repair attempt) and **durably persists** it into `runs.result`, so
-worktree reconstruction cannot lose it. `escalate`/`blocked` stop the autonomous
-loop. Free-form worker prose never mutates router state.
+checkout reconstruction cannot lose it. The file is rejected before reading if
+it exceeds 64 KiB. Arrays are limited to 256 string entries of 2,048 characters
+each; `root_cause`, `summary`, `uncertainty`, and `escalation_reason` are strings
+of at most 16,384 characters. Missing, malformed, oversized, mismatched, or
+shape-invalid evidence fails the attempt even when Hermes exits 0.
+`escalate`/`blocked` stop the autonomous loop. Free-form worker prose never
+mutates router state.
 
 ## Slack policy
 
@@ -130,7 +142,7 @@ Detailed logs belong in GitHub/task logs.
 | `sandbox-exec` | The fixed OS filesystem sandbox (bubblewrap curated root). |
 | `run-hermes-sandboxed` | Router-facing launcher that runs Hermes inside `sandbox-exec`. |
 | `deploy-fix-build-skill.sh` | Deploys the repo-controlled `fix-build` skill into the sandbox HOME. |
-| `sandbox-test.sh` | Deterministic boundary tests (worktree RW, host-credential denial). |
+| `sandbox-test.sh` | Deterministic runtime matrix: filesystem/proc denial, private Git + local commit, credential absence, DNS/HTTPS. |
 
 ## Accuracy note
 

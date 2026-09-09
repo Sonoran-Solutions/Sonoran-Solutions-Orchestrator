@@ -297,10 +297,13 @@ async function dispatch(rule, ctx) {
     repairRead = readRepairResult(repairResultFile, { expectedAttempt: repairAttempt });
     repairAction = classifyRepairResult(repairRead);
   }
+  // A zero process exit is necessary but not sufficient for a repair success:
+  // missing, malformed, oversized, or structurally invalid evidence fails closed.
+  const outcomeOk = result.ok && (!workerCfg.repair || repairRead?.ok === true);
 
   if (runId) {
     let runStatus = 'failed';
-    if (result.ok) {
+    if (outcomeOk) {
       if (repairAction?.action === 'escalate') runStatus = 'escalated';
       else if (repairAction?.action === 'blocked') runStatus = 'blocked';
       else if (!workerCfg.repair || repairAction?.action === 'candidate_fix') runStatus = 'success';
@@ -327,13 +330,13 @@ async function dispatch(rule, ctx) {
       // termination), so a failed repair never fabricates a blocked "success".
       if (repairAction?.action === 'escalate') state.updateTaskState(db, taskId, 'escalated');
       else if (repairAction?.action === 'blocked') state.updateTaskState(db, taskId, 'blocked');
-      else if (!result.ok) state.updateTaskState(db, taskId, 'in_progress');
+      else if (!outcomeOk) state.updateTaskState(db, taskId, 'in_progress');
     } else if (!result.ok) {
       state.updateTaskState(db, taskId, 'blocked');
     }
   }
 
-  return { ok: result.ok, taskId, runId, worktree, attempt, repairAttempt, repairAction: repairAction?.action ?? null, output: (result.stderr || result.stdout || '').slice(0, 500) };
+  return { ok: outcomeOk, taskId, runId, worktree, attempt, repairAttempt, repairAction: repairAction?.action ?? null, output: (result.stderr || result.stdout || '').slice(0, 500) };
 }
 
 async function handlePost(raw, headers) {

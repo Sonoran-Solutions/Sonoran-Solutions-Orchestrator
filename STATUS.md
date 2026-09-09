@@ -19,18 +19,18 @@ deliberate repair and M2.4 merge policy remain intentionally untouched.
   launcher `~/.local/bin/hermes`, data `~/.hermes`; `hermes --version` smoke OK.
   Runbook: [`hermes-watch/INSTALL.md`](hermes-watch/INSTALL.md).
 - **ORCH-096** — REAL OS/filesystem sandbox via `hermes-watch/sandbox-exec`
-  (bubblewrap curated root): assigned worktree RW + dedicated sandbox HOME
-  (`/home/hermes`) + read-only toolchain; host `~/.git-credentials`, `~/.ssh`,
-  `~/.config/sonoran`, the orchestrator checkout, and unrelated repos are NOT
-  visible. Proven by `hermes-watch/sandbox-test.sh`. Env allowlisting and
-  filesystem sandboxing are separate boundaries; `--yolo` is only used inside the
-  sandbox.
+  (Bubblewrap curated root): assigned task-private checkout RW + dedicated sandbox
+  HOME (`/home/hermes`) + read-only toolchain. Mount/user/IPC/PID/UTS/cgroup
+  isolation remains explicit; the network namespace is shared for outbound
+  inference transport, with only the resolved DNS file restored into fresh `/run`.
+  Host `~/.git-credentials`, `~/.ssh`, `~/.config/sonoran`, the orchestrator
+  checkout, unrelated sentinels, and `/proc/1/root` escape paths are inaccessible.
+  `--yolo` is only used inside this boundary.
 - **ORCH-097** — fix-build skill deployed from the repo source
   (`hermes-watch/deploy-fix-build-skill.sh`) into the sandbox Hermes HOME; the
   REAL Hermes (through the sandbox) lists `fix-build | software-development |
   local | local | enabled`; the skill consumes `SONORAN_*` context and writes a
-  structured result. Lease-validation wording corrected (possessing
-  `SONORAN_LEASE_ID` is not validation).
+  structured result. Provider authentication remains deferred to M2.3.
 - **ORCH-098** — control-plane-enforced repair-attempt limit. The budget counts
   REPAIR attempts only (new `runs.repair_attempt` column + `nextRepairAttempt`);
   unrelated planning/implementation runs do not consume it. Repair attempt 4 is
@@ -38,14 +38,16 @@ deliberate repair and M2.4 merge policy remain intentionally untouched.
 - **ORCH-099** — `escalate`/`blocked` results stop the autonomous repair loop;
   a subsequent automatic dispatch is refused (human re-authorization required).
 - **Blocker 4** — the validated structured repair result is durably persisted into
-  `runs.result` (status, attempt, files/commands, root cause, summary, uncertainty,
-  escalation reason, exit code, timeout, output excerpt); the result's claimed
-  `attempt` must match the router-owned repair attempt, and evidence survives
-  worktree reconstruction + SQLite reopen.
-- **Tests** — router suite is `54 passed, 0 failed` (repair-specific attempt
-  accounting, attempt-mismatch rejection, durable-evidence persistence across
-  reconstruction + reopen, non-repair runs not consuming the budget), plus
-  `hermes-watch/sandbox-test.sh` (filesystem boundary).
+  `runs.result`. A 64 KiB pre-read ceiling rejects oversized files without
+  truncation/parsing; arrays are capped at 256 string entries × 2,048 characters,
+  and evidence strings at 16,384 characters. Missing, malformed, oversized,
+  mismatched, or shape-invalid evidence plus process exit 0 still records a failed
+  attempt. Valid evidence survives checkout reconstruction + SQLite reopen.
+- **Tests** — router suite is `58 passed, 0 failed` (private Git metadata,
+  repair-specific attempt accounting, bounded/mismatched result rejection,
+  fail-closed exit-0 integration, durable evidence), plus
+  `hermes-watch/sandbox-test.sh` (filesystem/proc denials, real sandbox Git local
+  commit, publication credential absence, DNS, and outbound HTTPS).
 
 ## Done (earlier sessions)
 
@@ -71,8 +73,8 @@ deliberate repair and M2.4 merge policy remain intentionally untouched.
   - trusted-actor + `agent:ready` authorization gate;
   - SQLite `tasks`/`runs`/`deliveries`/`leases`;
   - handoff envelope parser/validator (`schema_version: 1`, legal transitions);
-  - per-task git worktree + **named task branch** + lease + allowed-path
-    pre-push guard.
+  - per-task standalone Git repository + **named task branch** + lease +
+    allowed-path pre-push guard; the worker has private refs/index/config/objects.
 - **ORCH-081 (base-ref movement)** — the pre-push guard now records the task's
   **base ref** and compares the live remote base tip against the recorded base
   SHA, separately from the pushed ref. A brand-new feature branch (all-zero
@@ -119,18 +121,18 @@ deliberate repair and M2.4 merge policy remain intentionally untouched.
   auto-reconciling). `done` stays terminal.
 - **Single active lease** — re-delivery releases prior active leases first; a
   stale lease never reaps a worktree a newer active lease still owns.
-- **Retry reconstructs clean state** — each new attempt rebuilds the worktree from
-  authoritative Git state (no dirty/local-only commit/old-base/wrong-branch
-  inheritance); an incompatible remote task branch fails closed rather than
-  auto-rebasing/merging.
+- **Retry reconstructs clean state** — each new attempt rebuilds a task-private
+  standalone repository from authoritative Git state (no shared alternates,
+  dirty/local-only commit/old-base/wrong-branch inheritance); an incompatible
+  remote task branch fails closed rather than auto-rebasing/merging.
 - **Raw lifecycle enforcement** — a brand-new task must start in
   `planned`/`authorized`/`assigned` (the trusted `agent:ready` signal is what
   authorizes; `planned` is preferred); an existing task's retry must follow legal
   transitions (`canEnterInProgress`), and `done` stays terminal (no reopen).
   No explicit `done → in_progress` reopen.
-- **Fail-closed worktree branch** — `createWorktree` never silently falls back to
-  a detached HEAD; if the named branch cannot be created/attached, the dispatch
-  fails closed.
+- **Fail-closed task branch** — `createWorktree` materializes the exact approved
+  commit in a private repository and never silently falls back to a detached HEAD;
+  branch/setup mismatch fails closed.
 - **Cleanup** — the obsolete `fetchLatest()` (`git fetch origin --all`) helper was
   removed; base refresh now uses `git fetch --prune origin` in `resolveBaseSha`.
 
@@ -144,8 +146,9 @@ deliberate repair and M2.4 merge policy remain intentionally untouched.
 - **M2.3** (ORCH-100…105) deliberate repair tests — intentionally not started.
 - **M2.4** (ORCH-106…110) review/merge policy — not started.
 - **ORCH-080** (verify lease ownership before push) still open — the pre-push guard
-  is a cooperative layer; router-owned push verification does not exist yet, so
-  Hermes's eventual candidate push path is deliberately deferred.
+  is a cooperative layer; router-owned push verification does not exist yet.
+  Hermes's task remote uses a disabled push URL and receives no GitHub publication
+  credentials, so candidate publication remains deliberately deferred.
 - **TOOL-026…029** (review gate + ruleset failure/push tests on DualDex) — the
   baseline ruleset (TOOL-021…025) is done; review-gate and adversarial tests
   remain.
