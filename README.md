@@ -8,6 +8,7 @@ The goal is **not** to build an autonomous fake company for its own sake. The go
 
 | Component | Role |
 |---|---|
+| **Flash-Next local worker** | Qualified local-first bounded implementation worker on the Super X; action-disciplined OpenCode profile, explicit 32K limits, independent verification required |
 | **Codex** | Planner, reviewer, debugger/bug fixer |
 | **Google Antigravity** | Primary implementer; human-steered during the initial rollout |
 | **Hermes Agent** | CI/build repair technician with bounded attempts |
@@ -27,7 +28,9 @@ Agent roles and model capability are separate concerns. Sonoran Solutions uses a
 
 > **Core rule:** Astra should usually receive evidence produced by cheaper models rather than being asked to gather all of the evidence itself.
 
-The current ladder runs from Flash-tier reconnaissance/mechanical work → Terra for normal serious engineering → DeepSeek Pro for hard problems/second opinions → Astra for bounded research and experimental reverse engineering. The durable architecture is **capability-tier based**, not tied to a permanent vendor or model name.
+The current ladder runs from a **local-first Flash-Next lane for qualified bounded implementation** → Flash-tier cloud reconnaissance/mechanical work → Terra for normal serious engineering → DeepSeek Pro for hard problems/second opinions → Astra for bounded research and experimental reverse engineering. The durable architecture is **capability-tier based**, not tied to a permanent vendor or model name.
+
+The local worker is a qualified *configuration*, not just a model name: Qwen3.8-Flash-Next UD-IQ1_S on llama.cpp/Vulkan at 32K, with explicit OpenCode context/output limits, an action-disciplined + bounded-read profile, hard task limits, and independent CI/review. See [`LOCAL_WORKER.md`](LOCAL_WORKER.md) for the evidence, failure modes, and integration contract.
 
 See [`MODEL_ROUTING.md`](MODEL_ROUTING.md) for model selection, escalation triggers, evidence-first handoffs, step-down rules, and examples across Sonoran projects.
 
@@ -81,6 +84,7 @@ See [`TOOLING_STACK.md`](TOOLING_STACK.md) for boundaries/integration rules and 
 |---|---|
 | [`AGENT_ORCHESTRATION_PLAN.md`](AGENT_ORCHESTRATION_PLAN.md) | Full architecture, authority model, trust boundaries, state machine, CI/review flow, and rollout strategy |
 | [`MODEL_ROUTING.md`](MODEL_ROUTING.md) | Cost-aware model ladder, escalation/step-down policy, evidence-first handoffs, and vendor-neutral capability routing |
+| [`LOCAL_WORKER.md`](LOCAL_WORKER.md) | Qualified Super X Flash-Next worker: runtime, agent profile, evidence, failure modes, and router integration contract |
 | [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) | Core phased checklist from manual DualDex pilot through safe automation |
 | [`TOOLING_STACK.md`](TOOLING_STACK.md) | Supporting tools: Linear, Rulesets, 1Password, Sentry, Tailscale, Renovate, Taskfile, and parked Dagger option |
 | [`TOOLING_ROADMAP.md`](TOOLING_ROADMAP.md) | Parallel `TOOL-###` adoption tasks aligned to the core orchestrator phases |
@@ -137,9 +141,11 @@ Before any unattended code execution:
 - GitHub Rulesets/required checks that the router cannot bypass;
 - orchestration secrets outside task worktrees.
 
-### M2 — Hermes repair pilot
+### M2 — Bounded repair/implementation pilot
 
-Define the canonical DualDex CI commands, run them in GitHub Actions, then let Hermes attempt controlled mechanical fixes on deliberately broken test branches. GitHub Actions remains authoritative and humans still merge.
+Define and enforce the canonical repository CI commands, run them in GitHub Actions, then let a bounded worker attempt controlled implementation/repair tasks on isolated branches. **Flash-Next is now the preferred local worker candidate for this lane; Hermes can remain a specialist/alternative rather than a prerequisite.** GitHub Actions remains authoritative and humans still merge.
+
+The local worker must use the qualified contract in [`LOCAL_WORKER.md`](LOCAL_WORKER.md): explicit model limits, action/bounded-read discipline, scope/worktree isolation, hard runtime limits, and independent verification.
 
 ### Evaluation gate
 
@@ -159,7 +165,7 @@ Use the proven system on SaveBridge, then later on Dungeon Dispatcher where appr
 
 Dagger remains parked until local/hosted CI divergence becomes a demonstrated problem.
 
-See [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) for the core implementation gates, [`TOOLING_ROADMAP.md`](TOOLING_ROADMAP.md) for the parallel supporting-tool checklist, and [`MODEL_ROUTING.md`](MODEL_ROUTING.md) for the model escalation policy used by workers.
+See [`IMPLEMENTATION_ROADMAP.md`](IMPLEMENTATION_ROADMAP.md) for the core implementation gates, [`TOOLING_ROADMAP.md`](TOOLING_ROADMAP.md) for the parallel supporting-tool checklist, [`MODEL_ROUTING.md`](MODEL_ROUTING.md) for the model escalation policy used by workers, and [`LOCAL_WORKER.md`](LOCAL_WORKER.md) for the qualified local implementation lane.
 
 ## Current prototype caveats
 
@@ -168,18 +174,18 @@ dispatch, worktrees + named branches + lease, base-ref movement guard, worker
 env allowlist, live-remote base tracking, envelope/PR-branch + existing-state
 cross-check, two-scope path policy, single-live-execution guard, retry-reconstructed
 clean worktree, single-lease semantics) is implemented and tested (`node test.mjs`
-→ 41 passing). It is **not yet production-safe** for unattended use until these
-remain:
+→ 41 passing on current `main`). It is **not yet production-safe** for unattended use.
 
-- GitHub Actions as the required-check authority (M2.1 `ci.sh` contract);
-- GitHub Rulesets so required checks/review cannot be bypassed by normal agent
-  credentials (TOOL-021+);
-- Hermes repair wiring with minimum-environment leases (M2.2), plus the
-  deliberate-failure M2.3 tests;
+DualDex already has the canonical `./ci.sh test|build|all` contract, GitHub Actions invokes that contract, and the active `protect-main` ruleset requires the `Native & Unit Tests` and `Build Debug APK` checks. The roadmap/status checkboxes have not all caught up to that reality yet.
 
-ORCH-080 (verify lease ownership before push) remains open: the pre-push guard is a
-cooperative layer, not router-owned push verification. Do not expose the router
-publicly or give it unattended code-editing authority until the above are complete.
+Important remaining boundaries include:
+
+- integrating a bounded worker through the router rather than only through benchmark harnesses;
+- ORCH-080 (verify lease ownership before push): the pre-push guard remains cooperative rather than router-owned push verification;
+- finishing deliberate-failure / end-to-end pilot tests before granting unattended write/push authority;
+- preserving GitHub Actions + repository rules as independent authority.
+
+Do not expose the router publicly or give it unattended merge authority during the pilot.
 
 ## Definition of success
 
@@ -189,4 +195,4 @@ The first meaningful milestone is not "four agents can talk to each other." It i
 
 > One real DualDex task can move from scoped product goal → implementation → review → independent CI → human merge with less context loss and less repetitive work than the manual workflow.
 
-If maintaining the orchestrator or its supporting SaaS stack starts consuming more time than it saves, pause it and return effort to SaveBridge / Dungeon Dispatcher.
+If maintaining the orchestrator or its supporting SaaS stack starts consuming more time than it saves, pause it and return effort to product work.
