@@ -6,7 +6,24 @@ import { fileURLToPath } from 'node:url';
 
 export const routerDir = join(fileURLToPath(import.meta.url), '..', '..'); // lib/ -> router/
 
-function validateConfig(cfg) { if (cfg.testFixtures === true && cfg.devMode !== true) throw new Error("testFixtures require devMode"); const maxWorker = Math.max(0, ...Object.values(cfg.workers || {}).filter(w => w.createsTask || w.repair).map(w => Number(w.timeoutMs || cfg.defaultTimeoutMs || 0))); const lease = Number(cfg.leaseDurationMs ?? 86400000); if (lease <= maxWorker + 2000 + 10000) throw new Error(`leaseDurationMs must exceed worker timeout + kill grace + safety margin (got ${lease}, need > ${maxWorker + 12000})`); return cfg; }
+export function validateConfig(cfg) {
+  if (cfg.testFixtures === true && cfg.devMode !== true) {
+    throw new Error('testFixtures require devMode');
+  }
+  const workers = Object.values(cfg.workers || {});
+  if (workers.some((worker) => worker.testFixture === true || worker.sandboxedTestFixture === true)
+      && !(cfg.devMode === true && cfg.testFixtures === true)) {
+    throw new Error('worker test fixtures require devMode=true and testFixtures=true');
+  }
+  const maxWorker = Math.max(0, ...workers
+    .filter((worker) => worker.createsTask || worker.repair)
+    .map((worker) => Number(worker.timeoutMs || cfg.defaultTimeoutMs || 0)));
+  const lease = Number(cfg.leaseDurationMs ?? 86400000);
+  if (lease <= maxWorker + 2000 + 10000) {
+    throw new Error(`leaseDurationMs must exceed worker timeout + kill grace + safety margin (got ${lease}, need > ${maxWorker + 12000})`);
+  }
+  return cfg;
+}
 
 export function loadConfig() {
   const candidates = [

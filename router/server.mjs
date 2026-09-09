@@ -119,7 +119,7 @@ async function dispatch(rule, ctx) {
   //   run -> launch worker (outside the lock).
   let taskId = null; let worktree = null; let runId = null;
   let attempt = null; let repairAttempt = null; let leaseId = null; let baseSha = null;
-  let startSha = null; let runStateDir = null; let runHome = null;
+  let startSha = null; let runStateDir = null; let runHome = null; let runHomeContainer = null;
   let workerAllowedPaths = []; let taskAllowedPaths = [];
   if (isCodeWorker) {
     try { taskId = makeTaskId(ctx.repo, ctx.issueNumber, ctx.headSha); } catch (e) { return refusal(`invalid task id: ${e.message}`); }
@@ -226,7 +226,8 @@ async function dispatch(rule, ctx) {
         if (workerCfg.repair) {
           const stateRoot = resolve(cfg.runStateRoot || join(cfg.__routerDir, '.run-state'));
           runStateDir = join(stateRoot, rid);
-          runHome = join('/home/dq/.hermes-sandbox/runs', rid, 'home');
+          runHomeContainer = join('/home/dq/.hermes-sandbox/runs', rid);
+          runHome = join(runHomeContainer, 'home');
           if (existsSync(runStateDir) || existsSync(runHome)) throw new Error('run state already exists');
           mkdirSync(runStateDir, { recursive: true, mode: 0o700 });
           mkdirSync(runHome, { recursive: true, mode: 0o700 });
@@ -236,7 +237,7 @@ async function dispatch(rule, ctx) {
           sourceRepo, expiresAt: new Date(Date.now() + (cfg.leaseDurationMs || 86400000)).toISOString(),
         });
         state.createRun(db, { id: rid, taskId, agent: rule.worker, attempt, repairAttempt: repairAttemptN, status: 'running' });
-        return { ok: true, worktree: wt, runId: rid, attempt, repairAttempt: repairAttemptN, leaseId: lid, baseSha, startSha: prepared.startSha, runStateDir, runHome };
+        return { ok: true, worktree: wt, runId: rid, attempt, repairAttempt: repairAttemptN, leaseId: lid, baseSha, startSha: prepared.startSha, runStateDir, runHome, runHomeContainer };
       } catch (e) {
         log(`[router] worktree setup failed for ${taskId}: ${e.message}`);
         state.updateTaskState(db, taskId, 'blocked');
@@ -254,6 +255,7 @@ async function dispatch(rule, ctx) {
     startSha = reservation.startSha ?? null;
     runStateDir = reservation.runStateDir ?? null;
     runHome = reservation.runHome ?? null;
+    runHomeContainer = reservation.runHomeContainer ?? null;
   }
 
   const vars = templateVars(ctx, {
@@ -289,7 +291,12 @@ async function dispatch(rule, ctx) {
       ALLOWED_PATHS: workerAllowedPaths.join('\n'),
       TASK_PATHS: taskAllowedPaths.join('\n'),
       BUILD_CMD: workerCfg.buildCmd || DEFAULT_REPAIR_BUILD_CMD,
-      RESULT_FILE: cfg.testFixtures === true && cfg.devMode === true && workerCfg.testFixture === true ? repairResultFile : "/run/sonoran/repair-result.json",
+      RESULT_FILE: cfg.testFixtures === true && cfg.devMode === true && workerCfg.testFixture === true
+        ? repairResultFile
+        : '/run/sonoran/repair-result.json',
+      TEST_FIXTURE: cfg.testFixtures === true && cfg.devMode === true && workerCfg.sandboxedTestFixture === true
+        ? 'sandboxed'
+        : '',
     };
     vars.meta = repairMeta;
   }
@@ -352,7 +359,7 @@ async function dispatch(rule, ctx) {
   } finally {
     if (leaseId) { try { state.releaseLease(db, leaseId); } catch (e) { log(`[router] failed to release lease ${leaseId}: ${e.message}`); } }
     if (runStateDir) { try { rmSync(runStateDir, { recursive: true, force: true }); } catch (e) { log(`[router] failed to remove run state ${runStateDir}: ${e.message}`); } }
-    if (runHome) { try { rmSync(runHome, { recursive: true, force: true }); } catch (e) { log(`[router] failed to remove run home ${runHome}: ${e.message}`); } }
+    if (runHomeContainer) { try { rmSync(runHomeContainer, { recursive: true, force: true }); } catch (e) { log(`[router] failed to remove run home container ${runHomeContainer}: ${e.message}`); } }
   }
 
   return { ok: outcomeOk, taskId, runId, worktree, attempt, repairAttempt, repairAction: repairAction?.action ?? null, output: (result.stderr || result.stdout || '').slice(0, 500) };
