@@ -10,13 +10,13 @@ import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pathMatches, verifyRepairCandidate } from './lib/repair-verify.mjs';
 import { makeTaskId, containedPath } from './lib/task-id.mjs';
-import { validateConfig } from './lib/config.mjs';
+import { validateConfig, CANONICAL_RUN_STATE_ROOT, CANONICAL_HERMES_RUN_HOME_ROOT } from './lib/config.mjs';
 
 const routerDir = dirname(fileURLToPath(import.meta.url));
 let passed = 0; let failed = 0;
@@ -912,6 +912,16 @@ test('config: fixture gates and lease lifetime fail closed at startup', () => {
   validateConfig({ devMode: true, testFixtures: true, leaseDurationMs: 60000, workers: { hermes: worker } });
 });
 
+test('config: router run-state roots are fixed to the production sandbox policy', () => {
+  const omitted = validateConfig({ devMode: false, workers: {} });
+  assert(omitted.runStateRoot === CANONICAL_RUN_STATE_ROOT, 'omitted runStateRoot normalizes to canonical root');
+  assert(validateConfig({ devMode: false, runStateRoot: CANONICAL_RUN_STATE_ROOT, workers: {} }).runStateRoot === CANONICAL_RUN_STATE_ROOT, 'explicit canonical runStateRoot accepted');
+  assertThrows(() => validateConfig({ devMode: false, runStateRoot: '/tmp/custom-run-state', workers: {} }), /runStateRoot must equal canonical sandbox root/, 'custom runStateRoot rejected');
+  assertThrows(() => validateConfig({ devMode: false, hermesRunHomeRoot: '/tmp/custom-hermes-home', workers: {} }), /hermesRunHomeRoot must equal canonical sandbox root/, 'custom Hermes HOME root rejected');
+  assert(CANONICAL_RUN_STATE_ROOT === '/home/dq/.local/state/sonoran-orchestrator/runs', 'router canonical state root matches sandbox policy');
+  assert(CANONICAL_HERMES_RUN_HOME_ROOT === '/home/dq/.hermes-sandbox/runs', 'router canonical HOME root matches sandbox policy');
+});
+
 // ---------------------------------------------------------------- integration (HTTP)
 async function httpRequest(port, { method = 'POST', path = '/', headers = {}, body } = {}) {
   return new Promise((resolve, reject) => {
@@ -1417,6 +1427,40 @@ async function startHermesRouter(dir, port, hermesWorker) {
   return { repoSlug, baseSha, child };
 }
 
+test('integration: reservation failure cleans only this attempt partial run state', async () => {
+  const cases = [
+    { failure: 'after-run-state', port: 8281, delivery: 'd-reservation-state' },
+    { failure: 'after-lease', port: 8282, delivery: 'd-reservation-lease' },
+  ];
+  for (const c of cases) {
+    const dir = mkdtempSync(join(tmpdir(), `sonoran-reservation-${c.failure}-`));
+    const fixture = writeFakeHermes(dir, { result: { status: 'no_fix' }, exitCode: 0 });
+    const beforeState = new Set(readdirSync('/home/dq/.local/state/sonoran-orchestrator/runs', { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name));
+    const beforeHome = new Set(readdirSync('/home/dq/.hermes-sandbox/runs', { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name));
+    const router = await startHermesRouter(dir, c.port, { program: 'node', args: [fixture], repair: true, testReservationFailure: c.failure, maxAttempts: 3, allowedPaths: ['app/src/**'], envAllowlist: ['PATH', 'HOME'] });
+    try {
+      const body = hermesIssueBody(router.repoSlug, router.baseSha, 'planned', c.delivery);
+      const response = await httpRequest(c.port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': c.delivery, 'X-Hub-Signature-256': sign('test-secret', body) }, body });
+      assert(response.status === 422 && response.body.refusal === true && /worktree setup failed/.test(response.body.reason), `${c.failure} refusal is explicit: ${JSON.stringify(response.body)}`);
+      const db = new DatabaseSync(join(dir, 'state.sqlite'), { readOnly: true });
+      const task = db.prepare('SELECT state FROM tasks WHERE id = ?').get('dualdex-40');
+      const runs = db.prepare('SELECT * FROM runs WHERE task_id = ?').all('dualdex-40');
+      const activeLeases = db.prepare("SELECT * FROM leases WHERE task_id = ? AND status = 'active'").all('dualdex-40');
+      db.close();
+      assert(task.state === 'blocked', `${c.failure} task is blocked`);
+      assert(runs.length === 0, `${c.failure} created no orphan run`);
+      assert(activeLeases.length === 0, `${c.failure} created no active orphan lease`);
+      const afterState = new Set(readdirSync('/home/dq/.local/state/sonoran-orchestrator/runs', { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name));
+      const afterHome = new Set(readdirSync('/home/dq/.hermes-sandbox/runs', { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name));
+      assert([...afterState].every((name) => beforeState.has(name)), `${c.failure} left no run-state directory`);
+      assert([...afterHome].every((name) => beforeHome.has(name)), `${c.failure} left no run-home container`);
+    } finally {
+      router.child.kill('SIGTERM'); await new Promise((r) => router.child.on('close', r));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
 function hermesEnvelope(baseSha, state = 'planned') {
   return `---
 schema_version: 1
@@ -1462,8 +1506,14 @@ test('integration: hermes repair receives the worktree + full structured context
   try {
     const body = hermesIssueBody(repoSlug, baseSha, 'planned', 'd-hctx-1');
     const res = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-hctx-1', 'X-Hub-Signature-256': sign('test-secret', body) }, body });
-    assert(res.status === 200 && res.body.ok === true, `hermes dispatched: ${JSON.stringify(res.body)}`);
+    assert(res.status === 200 && res.body.ok === false, `no_fix is an unsuccessful repair outcome: ${JSON.stringify(res.body)}`);
     assert(res.body.repairAction === 'no_fix', `structured result interpreted: ${JSON.stringify(res.body)}`);
+    const resultDb = new DatabaseSync(join(dir, 'state.sqlite'), { readOnly: true });
+    const noFixRun = resultDb.prepare('SELECT status FROM runs WHERE task_id = ?').get('dualdex-40');
+    const noFixTask = resultDb.prepare('SELECT state FROM tasks WHERE id = ?').get('dualdex-40');
+    const noFixCount = resultDb.prepare('SELECT COUNT(*) AS n FROM runs WHERE task_id = ? AND repair_attempt IS NOT NULL').get('dualdex-40').n;
+    resultDb.close();
+    assert(noFixRun.status === 'failed' && noFixTask.state === 'in_progress' && noFixCount === 1, 'no_fix consumes one retryable failed repair attempt');
     const dump = JSON.parse(readFileSync(join(dir, 'env-dump.json'), 'utf8'));
     assert(dump.worktree && dump.worktree !== join(dir, 'repos'), `worktree passed, not repo root (got ${dump.worktree})`);
     assert(dump.task === 'dualdex-40' && dump.run && dump.lease, 'task/run/lease identifiers present');
@@ -1487,7 +1537,7 @@ test('integration: hermes attempt limit allows 1..3 and refuses attempt 4 withou
     for (let i = 1; i <= 3; i++) {
       const body = hermesIssueBody(repoSlug, baseSha, i === 1 ? 'planned' : 'in_progress', `d-hatt-${i}`);
       const res = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': `d-hatt-${i}`, 'X-Hub-Signature-256': sign('test-secret', body) }, body });
-      assert(res.status === 200 && res.body.ok === true, `attempt ${i} allowed: ${JSON.stringify(res.body)}`);
+      assert(res.status === 200 && res.body.ok === false && res.body.repairAction === 'no_fix', `attempt ${i} runs as a failed no_fix attempt: ${JSON.stringify(res.body)}`);
     }
     const body4 = hermesIssueBody(repoSlug, baseSha, 'in_progress', 'd-hatt-4');
     const res4 = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-hatt-4', 'X-Hub-Signature-256': sign('test-secret', body4) }, body: body4 });
@@ -1498,7 +1548,7 @@ test('integration: hermes attempt limit allows 1..3 and refuses attempt 4 withou
     const rdb = new DatabaseSync(join(dir, 'state.sqlite'), { readOnly: true });
     const runs = rdb.prepare('SELECT * FROM runs WHERE task_id = ?').all('dualdex-40');
     rdb.close();
-    assert(runs.length === 3, `exactly 3 runs, no fourth launch (got ${runs.length})`);
+    assert(runs.length === 3 && runs.every((run) => run.status === 'failed'), `exactly 3 failed no_fix runs, no fourth launch (got ${runs.length})`);
   } finally {
     child.kill('SIGTERM'); await new Promise((r) => child.on('close', r)); rmSync(dir, { recursive: true, force: true });
   }
@@ -1712,7 +1762,7 @@ acceptance: |
     for (let i = 1; i <= 3; i++) {
       const body = mkBody('hermes', 'in_progress', [{ name: 'agent:ready' }, { name: 'repair' }], `d-rep-${i}`);
       const res = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': `d-rep-${i}`, 'X-Hub-Signature-256': sign('test-secret', body) }, body });
-      assert(res.status === 200 && res.body.ok === true && res.body.repairAttempt === i, `hermes repair ${i} allowed (repairAttempt ${i}): ${JSON.stringify(res.body)}`);
+      assert(res.status === 200 && res.body.ok === false && res.body.repairAction === 'no_fix' && res.body.repairAttempt === i, `hermes repair ${i} allowed as failed no_fix (repairAttempt ${i}): ${JSON.stringify(res.body)}`);
     }
     const body4 = mkBody('hermes', 'in_progress', [{ name: 'agent:ready' }, { name: 'repair' }], 'd-rep-4');
     const res4 = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-rep-4', 'X-Hub-Signature-256': sign('test-secret', body4) }, body: body4 });
@@ -1740,11 +1790,11 @@ test('integration: structured repair evidence persists after worktree reconstruc
     // Attempt 1: no_fix with structured evidence.
     const body1 = hermesIssueBody(repoSlug, baseSha, 'planned', 'd-hev-1');
     const res1 = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-hev-1', 'X-Hub-Signature-256': sign('test-secret', body1) }, body: body1 });
-    assert(res1.status === 200 && res1.body.ok === true && res1.body.repairAttempt === 1, `attempt 1 dispatched: ${JSON.stringify(res1.body)}`);
+    assert(res1.status === 200 && res1.body.ok === false && res1.body.repairAction === 'no_fix' && res1.body.repairAttempt === 1, `attempt 1 dispatched as failed no_fix: ${JSON.stringify(res1.body)}`);
     // Attempt 2 reconstructs the worktree (destroying attempt 1's result file).
     const body2 = hermesIssueBody(repoSlug, baseSha, 'in_progress', 'd-hev-2');
     const res2 = await httpRequest(port, { headers: { 'X-GitHub-Event': 'issues', 'X-GitHub-Delivery': 'd-hev-2', 'X-Hub-Signature-256': sign('test-secret', body2) }, body: body2 });
-    assert(res2.status === 200 && res2.body.ok === true && res2.body.repairAttempt === 2, `attempt 2 dispatched: ${JSON.stringify(res2.body)}`);
+    assert(res2.status === 200 && res2.body.ok === false && res2.body.repairAction === 'no_fix' && res2.body.repairAttempt === 2, `attempt 2 dispatched as failed no_fix: ${JSON.stringify(res2.body)}`);
   } finally {
     child.kill('SIGTERM'); await new Promise((r) => child.on('close', r));
     const rdb = new DatabaseSync(join(dir, 'state.sqlite'), { readOnly: true });

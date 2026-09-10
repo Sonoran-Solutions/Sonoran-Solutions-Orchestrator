@@ -14,6 +14,7 @@ import crypto from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { mkdirSync, existsSync, rmSync } from 'node:fs';
 import { loadConfig } from './lib/config.mjs';
+import { CANONICAL_RUN_STATE_ROOT, CANONICAL_HERMES_RUN_HOME_ROOT } from './lib/config.mjs';
 import { normalize, templateVars } from './lib/events.mjs';
 import { parseEnvelope, validateEnvelopeContext, pathScopes, validateNewTaskState, validateExistingTaskState, canEnterInProgress } from './lib/handoff.mjs';
 import { authorize } from './lib/auth.mjs';
@@ -213,6 +214,10 @@ async function dispatch(rule, ctx) {
 
       // Prepare a CLEAN named worktree from authoritative Git state; install the
       // path/base guard; create exactly one active lease + one running run.
+      let createdRunStateDir = null;
+      let createdRunHomeContainer = null;
+      let createdLeaseId = null;
+      let createdRunId = null;
       try {
         const prepared = prepareWorktreeForRun({
           sourceRepo, worktreeRoot: cfg.worktreeRoot, taskId, baseSha, branch: envelope.branch,
@@ -224,21 +229,45 @@ async function dispatch(rule, ctx) {
         const rid = crypto.randomUUID();
         const lid = crypto.randomUUID();
         if (workerCfg.repair) {
-          const stateRoot = resolve(cfg.runStateRoot || join(cfg.__routerDir, '.run-state'));
-          runStateDir = join(stateRoot, rid);
-          runHomeContainer = join('/home/dq/.hermes-sandbox/runs', rid);
-          runHome = join(runHomeContainer, 'home');
-          if (existsSync(runStateDir) || existsSync(runHome)) throw new Error('run state already exists');
-          mkdirSync(runStateDir, { recursive: true, mode: 0o700 });
-          mkdirSync(runHome, { recursive: true, mode: 0o700 });
+          const stateRoot = cfg.runStateRoot || CANONICAL_RUN_STATE_ROOT;
+          createdRunStateDir = join(stateRoot, rid);
+          createdRunHomeContainer = join(CANONICAL_HERMES_RUN_HOME_ROOT, rid);
+          const createdRunHome = join(createdRunHomeContainer, 'home');
+          if (existsSync(createdRunStateDir) || existsSync(createdRunHomeContainer)) throw new Error('run state already exists');
+          mkdirSync(createdRunStateDir, { recursive: true, mode: 0o700 });
+          mkdirSync(createdRunHome, { recursive: true, mode: 0o700 });
+          if (workerCfg.testReservationFailure === 'after-run-state') throw new Error('injected reservation failure after run-state creation');
         }
         state.createLease(db, {
           id: lid, taskId, worktree: wt, baseSha, owner: envelope.agent,
           sourceRepo, expiresAt: new Date(Date.now() + (cfg.leaseDurationMs || 86400000)).toISOString(),
         });
+        createdLeaseId = lid;
+        if (workerCfg.testReservationFailure === 'after-lease') throw new Error('injected reservation failure after lease creation');
+        createdRunId = rid;
         state.createRun(db, { id: rid, taskId, agent: rule.worker, attempt, repairAttempt: repairAttemptN, status: 'running' });
-        return { ok: true, worktree: wt, runId: rid, attempt, repairAttempt: repairAttemptN, leaseId: lid, baseSha, startSha: prepared.startSha, runStateDir, runHome, runHomeContainer };
+        return {
+          ok: true, worktree: wt, runId: rid, attempt, repairAttempt: repairAttemptN, leaseId: lid,
+          baseSha, startSha: prepared.startSha,
+          runStateDir: createdRunStateDir,
+          runHome: workerCfg.repair ? join(createdRunHomeContainer, 'home') : null,
+          runHomeContainer: createdRunHomeContainer,
+        };
       } catch (e) {
+        // This reservation did not reach the post-worker finalizer. Remove only
+        // resources created by this attempt, and release only its own lease/run.
+        if (createdRunId) {
+          try { state.updateRun(db, createdRunId, { status: 'failed', result: `reservation failed: ${String(e?.message || e).slice(0, 500)}` }); } catch (persistError) { log(`[router] failed to persist partial run ${createdRunId}: ${persistError.message}`); }
+        }
+        if (createdLeaseId) {
+          try { state.releaseLease(db, createdLeaseId); } catch (releaseError) { log(`[router] failed to release partial lease ${createdLeaseId}: ${releaseError.message}`); }
+        }
+        if (createdRunStateDir) {
+          try { rmSync(createdRunStateDir, { recursive: true, force: true }); } catch (cleanupError) { log(`[router] failed to remove partial run state ${createdRunStateDir}: ${cleanupError.message}`); }
+        }
+        if (createdRunHomeContainer) {
+          try { rmSync(createdRunHomeContainer, { recursive: true, force: true }); } catch (cleanupError) { log(`[router] failed to remove partial run home ${createdRunHomeContainer}: ${cleanupError.message}`); }
+        }
         log(`[router] worktree setup failed for ${taskId}: ${e.message}`);
         state.updateTaskState(db, taskId, 'blocked');
         return refusal('worktree setup failed', { detail: e.message });
@@ -318,6 +347,7 @@ async function dispatch(rule, ctx) {
   let repairAction = null;
   let repairVerification = null;
   let outcomeOk = result.ok && !workerCfg.repair;
+  let repairOutcomeOk = outcomeOk;
   try {
     if (workerCfg.repair) {
       repairRead = readRepairResult(repairResultFile, { expectedAttempt: repairAttempt });
@@ -327,13 +357,22 @@ async function dispatch(rule, ctx) {
         if (!repairVerification.ok) repairAction = { action: 'invalid', reason: `post-run Git verification: ${repairVerification.reason}` };
       }
     }
-    outcomeOk = result.ok && (!workerCfg.repair || (repairRead?.ok === true && repairAction?.action !== 'invalid'));
+    // `ok` is the HTTP repair-outcome signal: no_fix is structurally valid
+    // worker evidence, but it is not a successful repair.
+    if (workerCfg.repair) {
+      repairOutcomeOk = result.ok && repairRead?.ok === true && repairAction?.action !== 'invalid'
+        && repairAction?.action !== 'no_fix'
+        && (repairAction?.action !== 'candidate_fix' || repairVerification?.ok === true);
+      outcomeOk = repairOutcomeOk;
+    }
     if (runId) {
       let runStatus = 'failed';
-      if (outcomeOk) {
-        if (repairAction?.action === 'escalate') runStatus = 'escalated';
-        else if (repairAction?.action === 'blocked') runStatus = 'blocked';
-        else if (!workerCfg.repair || repairAction?.action === 'candidate_fix' || repairAction?.action === 'no_fix') runStatus = 'success';
+      if (workerCfg.repair) {
+        if (repairAction?.action === 'escalate' && result.ok && repairRead?.ok) runStatus = 'escalated';
+        else if (repairAction?.action === 'blocked' && result.ok && repairRead?.ok) runStatus = 'blocked';
+        else if (repairAction?.action === 'candidate_fix' && repairOutcomeOk) runStatus = 'success';
+      } else if (outcomeOk) {
+        runStatus = 'success';
       }
       const runResult = workerCfg.repair
         ? JSON.stringify(buildRepairRecord({ data: repairRead?.ok ? repairRead.data : null, action: repairAction?.action ?? null, error: repairRead?.ok ? (repairVerification?.ok === false ? repairVerification.reason : null) : repairRead.error, attempt: repairAttempt, exitCode: result.code, timedOut: result.timedOut, output: result.stderr || result.stdout || result.error || '' }))

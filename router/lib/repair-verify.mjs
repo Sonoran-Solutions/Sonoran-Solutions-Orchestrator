@@ -1,10 +1,12 @@
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
-function git(cwd,args){return execFileSync("git",args,{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],env:{...process.env,GIT_CONFIG_GLOBAL:"/dev/null",GIT_CONFIG_SYSTEM:"/dev/null"}});}
-function snapshot(worktree,startSha,expectedBranch){
+const DEFAULT_VERIFIER_TIMEOUT_MS = 10_000;
+const MAX_VERIFIER_OUTPUT_BYTES = 64 * 1024;
+function git(cwd,args){return execFileSync("git",args,{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],env:{...process.env,GIT_CONFIG_GLOBAL:"/dev/null",GIT_CONFIG_SYSTEM:"/dev/null",GIT_CONFIG_NOSYSTEM:"1",GIT_OPTIONAL_LOCKS:"0"}});}
+function snapshot(worktree,startSha,expectedBranch,verifierTimeoutMs=DEFAULT_VERIFIER_TIMEOUT_MS){
  const launcher=fileURLToPath(new URL("../../hermes-watch/verify-repair-sandboxed",import.meta.url));
- const raw=execFileSync(launcher,[worktree,startSha,expectedBranch],{encoding:"utf8",stdio:["ignore","pipe","pipe"]});
+ const raw=execFileSync(launcher,[worktree,startSha,expectedBranch],{encoding:"utf8",stdio:["ignore","pipe","pipe"],timeout:verifierTimeoutMs,maxBuffer:MAX_VERIFIER_OUTPUT_BYTES,env:{...process.env,GIT_CONFIG_GLOBAL:"/dev/null",GIT_CONFIG_SYSTEM:"/dev/null",GIT_CONFIG_NOSYSTEM:"1",GIT_OPTIONAL_LOCKS:"0"}});
  const f=Object.fromEntries(raw.trim().split("\n").map(x=>{const i=x.indexOf(":");return [x.slice(0,i),x.slice(i+1)]}));
  return {branch:f.BRANCH,head:f.HEAD,status:Buffer.from(f.STATUS_B64||"","base64").toString(),files:Buffer.from(f.FILES_B64||"","base64").toString("utf8")};
 }
@@ -13,9 +15,9 @@ function snapshot(worktree,startSha,expectedBranch){
 function rx(pattern){let o="^"; for(let i=0;i<pattern.length;i++){const c=pattern[i]; if(c==="*"&&pattern[i+1]==="*"){if(pattern[i+2]==="/"){o+="(?:.*/)?";i+=2;}else{o+=".*";i++;}}else if(c==="*")o+="[^/]*";else if(c==="?")o+="[^/]";else o+=/[\\^$+?.()|{}\[\]]/.test(c)?"\\"+c:c;} return new RegExp(o+"$");}
 export function pathMatches(path,patterns=[]){return patterns.some(p=>rx(String(p)).test(path));}
 export function pathsAllowed(path,worker,task){return pathMatches(path,worker)&&(!task.length||pathMatches(path,task));}
-export function verifyRepairCandidate({worktree,expectedBranch,startSha,workerAllowedPaths=[],taskAllowedPaths=[],declaredFiles=[]}){
+export function verifyRepairCandidate({worktree,expectedBranch,startSha,workerAllowedPaths=[],taskAllowedPaths=[],declaredFiles=[],verifierTimeoutMs=DEFAULT_VERIFIER_TIMEOUT_MS}){
  const fail=reason=>({ok:false,reason}); let x;
- try{x=snapshot(worktree,startSha,expectedBranch);}catch(e){return fail(`Git verification failed in verifier sandbox: ${e.message}`);}
+ try{x=snapshot(worktree,startSha,expectedBranch,verifierTimeoutMs);}catch(e){return fail(`Git verification failed in verifier sandbox: ${String(e.message || e).slice(0, 500)}`);}
  if(x.branch!==expectedBranch)return fail(`current branch '${x.branch}' does not equal assigned branch '${expectedBranch}'`);
  if(x.head===startSha)return fail("candidate has no committed change"); if(x.status)return fail("working tree is dirty");
  const actual=x.files.split("\0").filter(v=>v.length>0).sort(); if(!actual.length)return fail("actual changed-file set is empty");
