@@ -6,6 +6,10 @@
 
 **Rule:** do not advance a phase because the infrastructure looks cool. Advance only when the previous phase works on a real task and is making the workflow clearer, safer, or faster.
 
+M2.2 retains completed candidate checkouts for review. M2.4 must define their
+retention and garbage-collection policy as part of publication/rejection; the
+stale active-lease reaper must not delete released candidate artifacts.
+
 ---
 
 ## Status legend

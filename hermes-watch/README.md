@@ -121,6 +121,16 @@ shape-invalid evidence fails the attempt even when Hermes exits 0.
 `escalate`/`blocked` stop the autonomous loop. Free-form worker prose never
 mutates router state.
 
+`no_fix` is a valid, structurally well-formed result but an unsuccessful repair
+outcome: the run is recorded as `failed`, the repair attempt is consumed, and
+the task remains retryable while the three-attempt budget has room. A trusted
+`repair:retry` never resets or bypasses that budget.
+
+The production router and sandbox share fixed policy roots for run state and
+per-run Hermes HOME; custom roots are rejected at startup. The verifier uses a
+network-disabled Bubblewrap boundary, explicitly disables `core.fsmonitor`,
+and is bounded to 10 seconds with a 64 KiB output cap.
+
 ## Slack policy
 
 Avoid posting every build/retry/edit.

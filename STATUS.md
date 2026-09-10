@@ -52,13 +52,20 @@ deliberate repair and M2.4 merge policy remain intentionally untouched.
   production sandbox → external result → verifier → SQLite → cleanup path. An
   allowed committed candidate succeeds; a worker-declared candidate that commits
   an unauthorized path is rejected. This uses no LLM and is not an M2.3 repair.
-- **Tests** — router suite is `64 passed, 0 failed` (private Git metadata,
+- **Tests** — router suite is `66 passed, 0 failed` (private Git metadata,
   repair-specific attempt accounting, bounded/mismatched result rejection,
   trusted current-event `repair:retry`, production delivery IDs, F-09, durable
   evidence), plus
   `hermes-watch/sandbox-test.sh` (filesystem/proc denials, real sandbox Git local
   commit, publication credential absence, private-network denial, DNS, outbound
   HTTPS, and helper lifecycle).
+
+Completed candidate checkouts remain retained for review; M2.4 must define
+retention and garbage collection after publication/rejection. `no_fix` is a
+failed repair attempt, and `repair:retry` never resets the three-attempt budget.
+The production run-state and Hermes HOME roots are fixed security policy and
+custom roots are rejected. Verifier execution disables `core.fsmonitor` and is
+bounded by timeout/output limits.
 
 ## Done (earlier sessions)
 

@@ -46,7 +46,7 @@ router/
 | Exactly one active lease per task; stale lease never reaps an owned worktree | ✅ |
 | Worker env hygiene: allowlist-only environment (no router-secret leakage) | ✅ |
 | Hermes bounded repair worker: structured `SONORAN_*` context, bounded structured result file, attempt limit, escalation terminal | ✅ |
-| Tests: 64 passing (`node test.mjs`) + full runtime `hermes-watch/sandbox-test.sh` | ✅ |
+| Tests: 66 passing (`node test.mjs`) + full runtime `hermes-watch/sandbox-test.sh` | ✅ |
 
 A random public issue/PR **cannot** launch a worker: it needs a valid signature,
 an untrusted actor is rejected, a code-editing dispatch additionally needs a
@@ -78,6 +78,26 @@ Config is loaded from the first of:
 2. `router/config.local.json`
 3. `~/.config/sonoran/router.json`
 4. `router/config.example.json` (committed, no secrets — dev fallback)
+
+M2.2 uses fixed sandbox policy roots: run state is
+`/home/dq/.local/state/sonoran-orchestrator/runs` and per-run Hermes HOME is
+under `/home/dq/.hermes-sandbox/runs`. An omitted `runStateRoot` is normalized
+to the canonical state root; any custom root (or custom Hermes HOME root) is
+rejected at startup because the production sandbox cannot safely mount it.
+
+For repair outcomes, `candidate_fix` is successful only after router-owned Git
+verification. A valid `no_fix` result is a failed repair attempt (and remains
+retryable while budget remains), not a malformed result or success. Human
+`repair:retry` reauthorizes a terminal state only while the existing three-
+attempt budget has room; it never resets or bypasses that budget.
+
+Verifier Git runs are inside the network-disabled Bubblewrap verifier with
+global/system config disabled, optional locks disabled, `core.fsmonitor=false`,
+and a bounded 10-second execution/64 KiB output limit. Repository-local config
+is therefore contained and cannot hang or escape the router process.
+
+Completed candidate checkouts are intentionally retained. M2.4 must define
+retention and garbage collection after the publication/rejection lifecycle.
 
 Secrets never live in config: the webhook secret is read from
 `$GITHUB_WEBHOOK_SECRET` (configurable via `githubSecretEnv`) and the Slack
