@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+#
+# sandbox-exec — fixed OS/filesystem isolation boundary for the Hermes repair
+# worker (ORCH-096). Runs the given command inside a bubblewrap mount/user/pid
+# namespace with a CURATED root filesystem.
+#
+# The boundary is the sandbox, NOT the command autonomy. Command autonomy
+# (--yolo) is only acceptable because it executes INSIDE this namespace.
+#
+# Inputs are structured values only:
+#   - $SONORAN_WORKTREE  (router-injected; the only task directory mounted RW)
+#   - "$@"               (fixed argv from the router worker config)
+#
+# Task-controlled content NEVER chooses mounts, HOME, executable paths,
+# credentials, or network policy — every path below is fixed here.
+set -euo pipefail
+
+WORKTREE="${SONORAN_WORKTREE:?SONORAN_WORKTREE is required}"
+
+# Fixed sandbox policy (do NOT make these task-overridable).
+JDK="/home/dq/.local/jdks/jdk-17.0.20.1+1"
+ANDROID_SDK="/home/dq/Android/Sdk"
+HERMES_CODE="/home/dq/.hermes/hermes-agent"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NETWORK_POLICY="$HERE/network-policy"
+RESOLVER_FILE="$HERE/resolv-public.conf"
+RUN_ID="${SONORAN_RUN_ID:?SONORAN_RUN_ID is required}"
+if ! [[ "$RUN_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]; then
+  echo "invalid SONORAN_RUN_ID" >&2; exit 64
+fi
+SANDBOX_HOME="/home/dq/.hermes-sandbox/runs/$RUN_ID/home"
+BASE_SKILL="/home/dq/.hermes-sandbox/base/skills/software-development/fix-build/SKILL.md"
+RUN_STATE_HOST="/home/dq/.local/state/sonoran-orchestrator/runs/$RUN_ID"
+[ -d "$RUN_STATE_HOST" ] || { echo "run-state directory is missing" >&2; exit 64; }
+[ -d "$SANDBOX_HOME" ] || { echo "per-run Hermes HOME is missing" >&2; exit 64; }
+[ -f "$BASE_SKILL" ] || { echo "immutable fix-build skill is missing" >&2; exit 64; }
+[ -x "$NETWORK_POLICY" ] || { echo "network policy launcher is missing" >&2; exit 64; }
+[ -f "$RESOLVER_FILE" ] || { echo "sandbox resolver configuration is missing" >&2; exit 64; }
+
+# /etc/resolv.conf is a symlink into /run on this host. /run is intentionally a
+# fresh tmpfs, so mount a fixed public-resolver file at the symlink target. This
+# exposes neither host systemd-resolved nor any private-LAN DNS service.
+RESOLV_CONF="$(readlink -f /etc/resolv.conf)"
+DNS_MOUNTS=()
+if [ "$RESOLV_CONF" != "/etc/resolv.conf" ]; then
+  DNS_MOUNTS=(--dir "$(dirname "$RESOLV_CONF")" --ro-bind "$RESOLVER_FILE" "$RESOLV_CONF")
+else
+  DNS_MOUNTS=(--ro-bind "$RESOLVER_FILE" /etc/resolv.conf)
+fi
+RUN_MOUNTS=(--dir /run/sonoran --bind "$RUN_STATE_HOST" /run/sonoran)
+
+# Curated root: only the read-only toolchain root dirs are exposed, plus a
+# minimal /dev, a fresh /proc, and tmpfs for everything else. Bubblewrap always
+# creates a mount namespace; user/IPC/PID/UTS/cgroup namespaces are explicit below.
+# pasta creates the outer private user/network namespace and network-policy installs
+# its egress filter before Bubblewrap creates a nested user namespace. Bubblewrap
+# intentionally inherits that already-isolated network namespace. /home is tmpfs'd
+# and then only the dedicated sandbox HOME + task-private checkout are mounted, so
+# ~/.git-credentials, ~/.ssh, ~/.config/sonoran, the orchestrator checkout, and
+# unrelated repos/worktrees are NOT visible.
+bwrap_cmd=(bwrap \
+  --ro-bind /usr /usr \
+  --ro-bind /bin /bin \
+  --ro-bind /sbin /sbin \
+  --ro-bind /lib /lib \
+  --ro-bind /lib64 /lib64 \
+  --ro-bind /etc /etc \
+  --dev /dev \
+  --proc /proc \
+  --tmpfs /tmp \
+  --tmpfs /var \
+  --tmpfs /run \
+  --tmpfs /home \
+  --tmpfs /root \
+  --tmpfs /media \
+  --tmpfs /mnt \
+  --tmpfs /srv \
+  "${DNS_MOUNTS[@]}" \
+  --ro-bind "$JDK" /opt/jdk17 \
+  --ro-bind "$ANDROID_SDK" /opt/android-sdk \
+  --ro-bind "$HERMES_CODE" /opt/hermes-agent \
+  --ro-bind /home/dq/.local/share/uv/python /home/dq/.local/share/uv/python \
+  --bind "$SANDBOX_HOME" /home/hermes \
+  --dir /home/hermes/.hermes \
+  --dir /home/hermes/.hermes/skills \
+  --dir /home/hermes/.hermes/skills/software-development \
+  --dir /home/hermes/.hermes/skills/software-development/fix-build \
+  --ro-bind "$BASE_SKILL" /home/hermes/.hermes/skills/software-development/fix-build/SKILL.md \
+  "${RUN_MOUNTS[@]}" \
+  --bind "$WORKTREE" "$WORKTREE" \
+  --unshare-user \
+  --unshare-ipc \
+  --unshare-pid \
+  --unshare-uts \
+  --unshare-cgroup \
+  --die-with-parent \
+  --chdir "$WORKTREE" \
+  --setenv HOME /home/hermes \
+  --setenv HERMES_HOME /home/hermes/.hermes \
+  --setenv JAVA_HOME /opt/jdk17 \
+  --setenv ANDROID_HOME /opt/android-sdk \
+  --setenv ANDROID_SDK_ROOT /opt/android-sdk \
+  --setenv GIT_CONFIG_GLOBAL /dev/null \
+  --setenv GIT_CONFIG_SYSTEM /dev/null \
+  --setenv GIT_TERMINAL_PROMPT 0 \
+  --setenv GIT_ASKPASS /bin/false \
+  --setenv SSH_ASKPASS /bin/false \
+  --setenv GCM_INTERACTIVE Never \
+  --setenv PATH "/opt/jdk17/bin:/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/android-sdk/cmake/3.22.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  -- "$@")
+
+# Filesystem-only deterministic tests may exercise mounts without invoking the
+# network wrapper. Production/default execution always uses the isolated path.
+if [ "${SONORAN_FILESYSTEM_TEST:-0}" = "1" ]; then exec "${bwrap_cmd[@]}"; fi
+
+# Command mode makes pasta the lifecycle supervisor for the namespace and worker.
+# No host<->namespace port forwarding is enabled, host-gateway mapping is disabled,
+# and the nftables policy rejects loopback, link-local, CGNAT, and RFC1918 egress.
+# IPv4-only operation also prevents an unfiltered IPv6 path. The PID file permits
+# deterministic lifecycle assertions and is removed with this run-state directory.
+PASTA_PID_FILE="$RUN_STATE_HOST/network-helper.pid"
+[ ! -e "$PASTA_PID_FILE" ] || { echo "network helper state already exists" >&2; exit 64; }
+exec pasta --foreground --quiet --ipv4-only --config-net --no-map-gw \
+  --dns 1.1.1.1 --dns 1.0.0.1 \
+  --tcp-ports none --udp-ports none --tcp-ns none --udp-ns none \
+  --pid "$PASTA_PID_FILE" -- "$NETWORK_POLICY" "${bwrap_cmd[@]}"

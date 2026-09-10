@@ -20,7 +20,7 @@ router/
   lib/auth.mjs          trusted-actor / agent:ready authorization gate
   lib/state.mjs         SQLite state (tasks/runs/deliveries/leases)
   lib/workers.mjs       fixed-executable dispatch (shell:false, timeout)
-  lib/worktrees.mjs     per-task git worktrees + lease + push guard
+  lib/worktrees.mjs     task-private Git checkouts + lease + push guard
   test.mjs              test suite (node test.mjs)
 ```
 
@@ -36,16 +36,17 @@ router/
 | Authorization gate: trusted-actor allowlist and `agent:ready` label (labeler must be trusted) | ✅ |
 | SQLite `tasks`, `runs`, `deliveries`, `leases` (state survives restart) | ✅ |
 | Handoff envelope parser/validator (`schema_version: 1`, required fields, legal transitions) | ✅ |
-| Per-task git worktree + **named task branch** + lease + allowed-path / base-ref movement pre-push guard | ✅ (create/reap/guard, fail-closed) |
+| Per-task standalone Git repository + **named task branch** + lease + allowed-path / base-ref movement guard | ✅ (create/reap/guard, fail-closed) |
 | Live-remote base tracking: refresh + verify base SHA against `refs/remotes/origin/<baseRef>`, stale base refused | ✅ |
 | Envelope/context cross-check (repo/issue/branch/allowed_paths/base_sha, PR-head branch) | ✅ |
 | Path policy: worker baseline REQUIRED AND (optional) task scope enforced per file; task cannot widen worker baseline; omitted task scope = worker-baseline-only | ✅ |
-| Retry lifecycle: clean worktree reconstructed from authoritative Git state, incompatible branch fails closed | ✅ |
+| Retry lifecycle: clean private checkout reconstructed from authoritative Git state, incompatible branch fails closed | ✅ |
 | Single live execution per task: a 2nd delivery while a run is 'running' + an active, unexpired lease is refused | ✅ |
 | Existing-task envelope state must equal persisted task state (fail closed on mismatch); done stays terminal | ✅ |
 | Exactly one active lease per task; stale lease never reaps an owned worktree | ✅ |
 | Worker env hygiene: allowlist-only environment (no router-secret leakage) | ✅ |
-| Tests: 41 passing (`node test.mjs`) | ✅ |
+| Hermes bounded repair worker: structured `SONORAN_*` context, bounded structured result file, attempt limit, escalation terminal | ✅ |
+| Tests: 66 passing (`node test.mjs`) + full runtime `hermes-watch/sandbox-test.sh` | ✅ |
 
 A random public issue/PR **cannot** launch a worker: it needs a valid signature,
 an untrusted actor is rejected, a code-editing dispatch additionally needs a
@@ -53,14 +54,16 @@ valid handoff envelope, and the `agent:ready` path requires a trusted labeler.
 
 ## Not yet implemented (do not rely on these)
 
-- **GitHub Actions as the required-check authority** and **Hermes repair** are
-  M2 (see the roadmap) — not part of this control-plane milestone.
-- **M2.1 CI contract** (`ci.sh`) and **M2.2 Hermes install** remain open.
+- **GitHub Actions as the required-check authority** is wired for DualDex (the
+  `Native & Unit Tests` + `Build Debug APK` checks are required on `main`); the
+  router's own CI-event consumption is not yet built.
+- **Hermes candidate push** (ORCH-080, router-owned lease verification before
+  push) remains open. The pre-push guard is a *cooperative* layer; the M2.2
+  worker is wired to repair locally and return a structured result, but does not
+  push. Every task checkout has an explicitly disabled push URL and no publication
+  credentials. Push is deferred to the M2.4 pilot integration.
 - **Body-limit / concurrency / timeout paths** are implemented but exercised only
   indirectly by the HTTP integration test.
-- **ORCH-080 (router-owned lease verification before push)** remains open. The
-  pre-push guard is a *cooperative* layer; router-owned push verification does not
-  exist yet.
 
 Note on ORCH-081/083: both **are wired**. The pre-push guard records the task's
 base ref and blocks a push when the live remote base tip moved from the recorded
@@ -75,6 +78,26 @@ Config is loaded from the first of:
 2. `router/config.local.json`
 3. `~/.config/sonoran/router.json`
 4. `router/config.example.json` (committed, no secrets — dev fallback)
+
+M2.2 uses fixed sandbox policy roots: run state is
+`/home/dq/.local/state/sonoran-orchestrator/runs` and per-run Hermes HOME is
+under `/home/dq/.hermes-sandbox/runs`. An omitted `runStateRoot` is normalized
+to the canonical state root; any custom root (or custom Hermes HOME root) is
+rejected at startup because the production sandbox cannot safely mount it.
+
+For repair outcomes, `candidate_fix` is successful only after router-owned Git
+verification. A valid `no_fix` result is a failed repair attempt (and remains
+retryable while budget remains), not a malformed result or success. Human
+`repair:retry` reauthorizes a terminal state only while the existing three-
+attempt budget has room; it never resets or bypasses that budget.
+
+Verifier Git runs are inside the network-disabled Bubblewrap verifier with
+global/system config disabled, optional locks disabled, `core.fsmonitor=false`,
+and a bounded 10-second execution/64 KiB output limit. Repository-local config
+is therefore contained and cannot hang or escape the router process.
+
+Completed candidate checkouts are intentionally retained. M2.4 must define
+retention and garbage collection after the publication/rejection lifecycle.
 
 Secrets never live in config: the webhook secret is read from
 `$GITHUB_WEBHOOK_SECRET` (configurable via `githubSecretEnv`) and the Slack
@@ -108,7 +131,7 @@ GITHUB_WEBHOOK_SECRET=... SLACK_WEBHOOK_URL=... node server.mjs
 Interpolation uses only the normalized context (`{{repo}}`, `{{branch}}`,
 `{{task}}`, `{{link}}`, `{{prompt}}`, `{{worktree}}`…), never raw body text.
 `createsTask: true` marks a worker as code-editing: it requires a valid handoff
-envelope and gets an isolated worktree + lease.
+envelope and gets an isolated task-private Git checkout + lease.
 
 `envAllowlist` is the **only** environment a worker sees. Default when omitted is
 `["PATH", "HOME"]`. The router never passes its own secrets to a worker, so the
@@ -120,15 +143,78 @@ webhook secret. `SONORAN_TASK_ID` and `SONORAN_WORKTREE` are always added.
 `defaultBaseRef` (default `"main"`) names which branch a task is based on,
 falling back to the PR base ref when the event carries one.
 
+### Repair workers (Hermes)
+
+A worker with `"repair": true` is a bounded repair worker (and is inherently a
+code worker, so it always gets an envelope + worktree + lease). It additionally:
+
+- runs behind the fixed sandbox launcher (`program` points at
+  `../hermes-watch/run-hermes-sandboxed`, not the raw `hermes` binary), so it
+  gets a curated filesystem (assigned private checkout RW + dedicated sandbox
+  HOME + a read-only toolchain; no owner credentials/SSH/Sonoran config), explicit
+  user/IPC/PID/UTS/cgroup namespaces, plus a `pasta`-created private network
+  namespace whose immutable nftables policy denies host loopback, RFC1918,
+  CGNAT, and link-local destinations while allowing public DNS/HTTPS;
+- receives structured `SONORAN_*` context instead of a free-form prompt: task/run/
+  lease IDs, repo, branch, base SHA, REPAIR attempt/max-attempts, allowed/task
+  paths, canonical build command, and `SONORAN_RESULT_FILE`;
+- must write a structured JSON result to `SONORAN_RESULT_FILE` with `status` in
+  `candidate_fix | no_fix | escalate | blocked` and an `attempt` that matches the
+  router-owned repair attempt; the router rejects files over 64 KiB before reading,
+  arrays over 256 entries, array members over 2,048 characters or not strings, and
+  evidence strings over 16,384 characters;
+- is subject to a control-plane-enforced **repair-attempt** limit (`maxAttempts`,
+  default `3`): repair attempt `N+1` is refused before a worker launches. The
+  budget counts repair runs only — unrelated planning/implementation runs do not
+  consume it;
+- has `escalate`/`blocked` treated as terminal for the autonomous loop: the next
+  automatic dispatch is refused until a human re-authorizes;
+- has its validated structured evidence **durably persisted** into `runs.result`
+  (surviving worktree reconstruction), via the `repair_attempt` column.
+
+```jsonc
+"hermes": {
+  "program": "../hermes-watch/run-hermes-sandboxed",
+  "args": ["-z", "{{prompt}}", "--in", "{{worktree}}", "--skills", "fix-build", "--yolo"],
+  "createsTask": true, "repair": true, "maxAttempts": 3,
+  "buildCmd": "./ci.sh test",
+  "allowedPaths": ["app/src/**", "native/**", "*.md"],
+  "envAllowlist": ["PATH", "HOME"]
+}
+```
+
+The router interprets + persists the structured result; free-form worker prose
+never mutates router state. A process exit 0 plus missing/malformed/oversized/
+mismatched evidence is still a failed repair attempt. Env allowlisting (router),
+filesystem sandboxing (launcher), and isolated outbound network transport are
+separate explicit boundaries. Network transport is provided by foreground
+`pasta` command mode with every port-forwarding direction disabled,
+`--no-map-gw`, IPv4-only operation, fixed public DNS, and an in-namespace
+nftables private-range deny policy. Provider authentication remains deferred to
+M2.3.
+
+### Real sandbox fixture (F-09)
+
+`node real-sandbox-fixture.test.mjs` sends a synthetic HTTP delivery through the
+real router reservation path, task-private Git checkout, production
+`sandbox-exec`, external `/run/sonoran/repair-result.json` channel, router-owned
+verifier sandbox, durable SQLite evidence, and cleanup finalizer. Its positive
+case commits one allowed path and is accepted; its negative case commits an
+unauthorized path while claiming `candidate_fix` and is rejected by the router.
+The deterministic model replacement is available only when both `devMode` and
+`testFixtures` are true and the worker declares `sandboxedTestFixture`; startup
+validation rejects that worker flag in production configuration. No model or
+provider credential is used.
+
 ### Allowed-path policy (two scopes, never widening)
 
 Path scope is two independent scopes, both enforced per changed file by the
 cooperative pre-push guard:
 
 - **worker/repository baseline** = the worker's `allowedPaths` (the REQUIRED MAXIMUM
-  trusted boundary). Always written to `.sonoran-worker-allowed-paths`.
+  trusted boundary). Stored under the private repository's `.git/sonoran` metadata.
 - **task scope** = the envelope's `allowed_paths` (an OPTIONAL additional narrowing
-  boundary). Written to `.sonoran-task-allowed-paths` **only when non-empty**;
+  boundary). Stored alongside it **only when non-empty**;
   omitted task scope means worker-baseline-only, NOT deny-all.
 
 A file must match BOTH when a task scope exists. A task `allowed_paths` of `*` can
@@ -141,16 +227,19 @@ a later run supplies no task scope, so an old restriction cannot leak forward.
 > not an unbypassable security boundary. ORCH-080 (router-owned lease verification
 > before push) remains open.
 
-### Worktree retry + single-live-execution lifecycle
+### Private-checkout retry + single-live-execution lifecycle
 
-Each new execution attempt reconstructs a clean named worktree from authoritative
-Git state (`prepareWorktreeForRun`): it removes any prior worktree for the task,
+Each new execution attempt reconstructs a clean named standalone repository from
+authoritative Git state (`prepareWorktreeForRun`): it removes any prior checkout,
+transfers the approved starting commit without alternates/shared hardlinks, and
 refreshes the remote, and either uses the task branch from origin (only if it is
 compatible with the verified base — otherwise it fails closed and refuses rather
 than auto-rebasing/merging) or recreates it from the verified base SHA. A retry
 never inherits dirt, local-only commits, an old base, or the wrong branch. The
-worktree must be on the expected named branch, non-detached, clean, and at the
-expected starting commit before a worker is launched.
+private checkout must be on the expected named branch, non-detached, clean, and
+at the expected starting commit before a worker is launched. Its `.git` directory
+contains task-private refs/index/config/objects; the shared router repository is
+not mounted or writable by the worker.
 
 At most **one live execution** may exist per task. The router's live-execution
 ownership signal is: a run still marked `running` AND an active, unexpired lease.
@@ -199,7 +288,7 @@ node test.mjs
 
 Covers handoff parsing/validation, authorization, event normalization, SQLite
 state (dedupe/idempotent re-delivery/single active lease/stale-lease ownership/
-live-execution detection), worktrees (named branch, safe branch names, live-remote
+live-execution detection), task-private repositories (named branch, safe branch names, live-remote
 base tracking, fetch-failure fail-closed, retry-clean lifecycle, incompatible-branch
 fail-closed, omitted-task-scope = worker-baseline-only, stale task-scope removal),
 two-scope push-guard enforcement, shell-injection safety, worker env allowlist

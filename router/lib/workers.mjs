@@ -19,8 +19,9 @@ export function interpolateArgs(args, vars) {
 // Build the worker's environment from an explicit allowlist (ORCH-096: "minimum
 // required environment"). The router process legitimately holds the GitHub webhook
 // secret and the Slack webhook URL; a generic worker must NEVER inherit them.
-// Only allowlisted keys pass through, plus the task/worktree the worker needs.
-export function buildWorkerEnv(workerCfg = {}, { taskId = null, worktree = '', env = process.env } = {}) {
+// Only allowlisted keys pass through, plus the task/worktree and any structured
+// SONORAN_* metadata the router explicitly injects for that run.
+export function buildWorkerEnv(workerCfg = {}, { taskId = null, worktree = '', env = process.env, meta = {} } = {}) {
   const allow = Array.isArray(workerCfg.envAllowlist) && workerCfg.envAllowlist.length
     ? workerCfg.envAllowlist
     : ['PATH', 'HOME'];
@@ -30,6 +31,9 @@ export function buildWorkerEnv(workerCfg = {}, { taskId = null, worktree = '', e
   }
   if (taskId != null) out.SONORAN_TASK_ID = String(taskId);
   if (worktree) out.SONORAN_WORKTREE = String(worktree);
+  for (const [k, v] of Object.entries(meta)) {
+    if (v !== undefined && v !== null && v !== '') out[`SONORAN_${k}`] = String(v);
+  }
   return out;
 }
 

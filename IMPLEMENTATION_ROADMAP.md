@@ -6,6 +6,10 @@
 
 **Rule:** do not advance a phase because the infrastructure looks cool. Advance only when the previous phase works on a real task and is making the workflow clearer, safer, or faster.
 
+M2.2 retains completed candidate checkouts for review. M2.4 must define their
+retention and garbage-collection policy as part of publication/rejection; the
+stale active-lease reaper must not delete released candidate artifacts.
+
 ---
 
 ## Status legend
@@ -217,18 +221,18 @@ This phase is intentionally before Hermes/autonomous handoffs.
 ## M1.5.7 — Worktree + lease isolation
 
 - [x] **ORCH-077** Define the local worktree root outside the orchestrator source checkout. (`worktreeRoot` config)
-- [x] **ORCH-078** Create one worktree per task/lease.
+- [x] **ORCH-078** Create one task-private standalone Git checkout per task/lease (private refs/index/config/objects; no shared alternates or linked-worktree metadata).
 - [x] **ORCH-079** Record worktree path + base SHA + owner in SQLite. (`leases` table)
 - [ ] **ORCH-080** Verify lease ownership before commit/push. (still open: the pre-push guard is a *cooperative* layer and does not yet confirm the pusher holds the active lease; router-owned push verification does not exist)
 - [x] **ORCH-081** Stop/escalate if the branch moved unexpectedly. (pre-push guard compares the live remote base tip against the recorded base SHA, independent of the pushed ref; `resolveBaseSha` tracks the live remote tip and refuses a stale provided base)
 - [x] **ORCH-082** Enforce `allowed_paths` before commit/push. (worker/repository baseline REQUIRED AND optional task scope enforced per file; task cannot widen the worker baseline; an omitted task scope means worker-baseline-only, and a stale task-scope file is removed)
-- [x] **ORCH-083** Clean/reap expired worktrees safely. (periodic `reapExpired()` in `server.mjs`; a stale lease never reaps a worktree a newer active lease owns)
-- [x] **ORCH-140 (lifecycle groundwork)** Retries reconstruct a clean worktree from authoritative Git state (`prepareWorktreeForRun`); incompatible remote task branches fail closed rather than auto-rebasing. (full M3.3 review/verification automation remains)
-- [x] **Single live execution per task** — a delivery that finds a run still `running` + an active, unexpired lease is refused (`task already has an active execution`) and never releases the lease/worktree/launches a second worker; stale `running` runs are reconciled to `abandoned`. Serialized per task with an in-process lock. The handoff envelope's `state` must equal persisted task state for existing tasks (fail closed on mismatch).
+- [x] **ORCH-083** Clean/reap expired task checkouts safely. (periodic `reapExpired()` in `server.mjs`; a stale lease never reaps a worktree a newer active lease owns)
+- [x] **ORCH-140 (lifecycle groundwork)** Retries reconstruct a clean task-private repository from authoritative Git state (`prepareWorktreeForRun`); incompatible remote task branches fail closed rather than auto-rebasing. (full M3.3 review/verification automation remains)
+- [x] **Single live execution per task** — a delivery that finds a run still `running` + an active, unexpired lease is refused (`task already has an active execution`) and never releases the lease/checkout/launches a second worker; stale `running` runs are reconciled to `abandoned`. Serialized per task with an in-process lock. The handoff envelope's `state` must equal persisted task state for existing tasks (fail closed on mismatch).
 
 ### M1.5 exit criteria
 
-A signed, authorized test event can create **exactly one** durable task/run and isolated worktree. Duplicate/untrusted/malicious events cannot launch arbitrary commands or duplicate work.
+A signed, authorized test event can create **exactly one** durable task/run and isolated task-private checkout. Duplicate/untrusted/malicious events cannot launch arbitrary commands or duplicate work.
 
 **GATE:** do not connect an autonomous code-editing worker until this phase passes.
 
@@ -240,19 +244,25 @@ A signed, authorized test event can create **exactly one** durable task/run and 
 
 ## M2.1 — Define the DualDex CI contract
 
-- [ ] **ORCH-090** Choose canonical build command(s), e.g. `./ci.sh build` and `./ci.sh test`.
-- [ ] **ORCH-091** Make the commands deterministic/non-interactive.
-- [ ] **ORCH-092** Ensure a developer/agent can run them locally.
-- [ ] **ORCH-093** Add/update GitHub Actions to run the same CI contract.
-- [ ] **ORCH-094** Configure required checks for the pilot PR flow.
+- [x] **ORCH-090** Choose canonical build command(s): `./ci.sh build` / `./ci.sh test` / `./ci.sh all` (merged in DualDex #28).
+- [x] **ORCH-091** Make the commands deterministic/non-interactive.
+- [x] **ORCH-092** Ensure a developer/agent can run them locally.
+- [x] **ORCH-093** Add/update GitHub Actions to run the same CI contract (`Native & Unit Tests`, `Build Debug APK`).
+- [x] **ORCH-094** Configure required checks for the pilot PR flow (DualDex `protect-main` ruleset, verified by read-back).
 
 ## M2.2 — Hermes setup
 
-- [ ] **ORCH-095** Install/configure Hermes on the self-hosted machine.
-- [ ] **ORCH-096** Give Hermes only the task worktree and minimum required environment.
-- [ ] **ORCH-097** Update the fix-build skill to consume task/run/lease scope from the router.
-- [ ] **ORCH-098** Set a bounded repair limit (start with 3; increase only if evidence supports it).
-- [ ] **ORCH-099** Require escalation for API/schema/product/security decisions.
+- [x] **ORCH-095** Install/configure Hermes on the self-hosted machine (`hermes-agent` v0.21.1, `~/.hermes`).
+- [x] **ORCH-096** Give Hermes only the task-private checkout and minimum required environment (structured `SONORAN_*` metadata + env allowlist); use a supervised `pasta` private network namespace plus immutable nftables private-range denial while allowing public DNS/HTTPS transport.
+- [x] **ORCH-097** Update the fix-build skill to consume task/run/lease scope from the router (structured result file contract).
+- [x] **ORCH-098** Set a bounded repair limit (control-plane enforced `maxAttempts: 3`; attempt 4 refused).
+- [x] **ORCH-099** Require escalation for API/schema/product/security decisions (`escalate`/`blocked` stop the autonomous loop).
+
+Deterministic boundary fixture F-09 is complete: synthetic HTTP traverses the
+real router, production sandbox, external result channel, verifier, durable
+SQLite evidence, and cleanup. It replaces the model with a dev-gated fixed
+command and does not begin the real autonomous repairs in M2.3. ORCH-080 remains
+open; no candidate push occurs.
 
 ## M2.3 — Deliberate failure tests
 

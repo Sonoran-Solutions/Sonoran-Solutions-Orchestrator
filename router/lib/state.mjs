@@ -9,8 +9,9 @@ export function openDb(path) {
   const db = new DatabaseSync(path);
   db.exec('PRAGMA journal_mode = WAL;');
   init(db);
-  // Lightweight migration for DBs created before base_ref was tracked.
+  // Lightweight migration for DBs created before base_ref / repair_attempt were tracked.
   ensureColumn(db, 'tasks', 'base_ref', 'base_ref TEXT');
+  ensureColumn(db, 'runs', 'repair_attempt', 'repair_attempt INTEGER');
   return db;
 }
 
@@ -111,16 +112,32 @@ export function updateTaskState(db, id, state) {
 }
 
 export function createRun(db, run) {
-  db.prepare(`INSERT INTO runs (id, task_id, agent, attempt, status, started_at)
-              VALUES (?,?,?,?,?,?)`)
-    .run(run.id, run.taskId, run.agent, run.attempt ?? 1, run.status || 'running', now());
+  db.prepare(`INSERT INTO runs (id, task_id, agent, attempt, repair_attempt, status, started_at)
+              VALUES (?,?,?,?,?,?,?)`)
+    .run(run.id, run.taskId, run.agent, run.attempt ?? 1, run.repairAttempt ?? null, run.status || 'running', now());
   return run.id;
 }
 
 // next attempt number for a task (1-based): the highest previous attempt + 1.
+// This counts the task's TOTAL execution history across every worker.
 export function nextAttempt(db, taskId) {
   const r = db.prepare('SELECT COALESCE(MAX(attempt), 0) AS m FROM runs WHERE task_id = ?').get(taskId);
   return ((r && r.m) || 0) + 1;
+}
+
+// Next REPAIR attempt number for a task (1-based), counting only repair-worker
+// runs — not the task's total lifetime run count (ORCH-098). Unrelated
+// planning/implementation runs must not consume the repair budget.
+export function nextRepairAttempt(db, taskId) {
+  const r = db.prepare('SELECT COALESCE(MAX(repair_attempt), 0) AS m FROM runs WHERE task_id = ?').get(taskId);
+  return ((r && r.m) || 0) + 1;
+}
+
+// Durable prior repair evidence for a task (oldest → newest). The structured
+// result is persisted in `runs.result`, so it survives worktree reconstruction
+// and is retrievable for evidence feeding / auditing.
+export function repairRuns(db, taskId) {
+  return db.prepare(`SELECT * FROM runs WHERE task_id = ? AND repair_attempt IS NOT NULL ORDER BY repair_attempt ASC`).all(taskId);
 }
 
 export function updateRun(db, id, { status, result }) {

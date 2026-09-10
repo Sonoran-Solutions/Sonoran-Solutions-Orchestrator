@@ -11,13 +11,19 @@
 //   - timeout + concurrency limits and clean shutdown.
 import http from 'node:http';
 import crypto from 'node:crypto';
+import { join, resolve } from 'node:path';
+import { mkdirSync, existsSync, rmSync } from 'node:fs';
 import { loadConfig } from './lib/config.mjs';
+import { CANONICAL_RUN_STATE_ROOT, CANONICAL_HERMES_RUN_HOME_ROOT } from './lib/config.mjs';
 import { normalize, templateVars } from './lib/events.mjs';
 import { parseEnvelope, validateEnvelopeContext, pathScopes, validateNewTaskState, validateExistingTaskState, canEnterInProgress } from './lib/handoff.mjs';
 import { authorize } from './lib/auth.mjs';
 import * as state from './lib/state.mjs';
 import { resolveProgram, interpolateArgs, runWorker, buildWorkerEnv } from './lib/workers.mjs';
+import { DEFAULT_MAX_REPAIR_ATTEMPTS, DEFAULT_REPAIR_BUILD_CMD, readRepairResult, classifyRepairResult, buildRepairRecord, attemptExceeded } from './lib/hermes.mjs';
 import { ensureRepo, prepareWorktreeForRun, installPushGuard, removeWorktreePath, resolveBaseSha, resolveCommitSha } from './lib/worktrees.mjs';
+import { makeTaskId } from './lib/task-id.mjs';
+import { verifyRepairCandidate } from './lib/repair-verify.mjs';
 
 const cfg = loadConfig();
 const PORT = cfg.port || 8090;
@@ -81,11 +87,6 @@ function matchRule(rule, ctx) {
   return true;
 }
 
-function sanitizeTaskId(repo, issueNumber, headSha) {
-  const name = String(repo).split('/').pop().replace(/[^A-Za-z0-9._-]/g, '') || 'repo';
-  const num = issueNumber != null ? issueNumber : (headSha || '').slice(0, 7);
-  return `${name}-${num || Date.now()}`;
-}
 
 function refusal(reason, extra = {}) {
   return { ok: false, refusal: true, reason, ...extra };
@@ -95,7 +96,9 @@ async function dispatch(rule, ctx) {
   const workerCfg = (cfg.workers || {})[rule.worker];
   if (!workerCfg) return { ok: false, reason: `unknown worker '${rule.worker}'` };
 
-  const isCodeWorker = !!workerCfg.createsTask;
+  // A repair worker is inherently a code worker: it edits the task worktree, so
+  // it must always go through the envelope + worktree + lease reservation path.
+  const isCodeWorker = !!workerCfg.createsTask || !!workerCfg.repair;
 
   // Code-editing dispatch requires a valid handoff envelope (ORCH-073..076).
   let envelope = null;
@@ -116,8 +119,11 @@ async function dispatch(rule, ctx) {
   //   -> install path/base guard -> create one active lease -> create one running
   //   run -> launch worker (outside the lock).
   let taskId = null; let worktree = null; let runId = null;
+  let attempt = null; let repairAttempt = null; let leaseId = null; let baseSha = null;
+  let startSha = null; let runStateDir = null; let runHome = null; let runHomeContainer = null;
+  let workerAllowedPaths = []; let taskAllowedPaths = [];
   if (isCodeWorker) {
-    taskId = sanitizeTaskId(ctx.repo, ctx.issueNumber, ctx.headSha);
+    try { taskId = makeTaskId(ctx.repo, ctx.issueNumber, ctx.headSha); } catch (e) { return refusal(`invalid task id: ${e.message}`); }
     const baseRef = ctx.baseRef || cfg.defaultBaseRef || 'main';
 
     // Cross-check envelope repo/issue/branch/allowed_paths against the event/state.
@@ -127,7 +133,7 @@ async function dispatch(rule, ctx) {
     // Two independent path scopes: worker/repository baseline (REQUIRED maximum)
     // AND the optional task narrowing boundary. A task can never widen the worker
     // baseline; an omitted task scope means worker-baseline-only (not deny-all).
-    const { worker: workerAllowedPaths, task: taskAllowedPaths } = pathScopes(envelope, workerCfg.allowedPaths);
+    ({ worker: workerAllowedPaths, task: taskAllowedPaths } = pathScopes(envelope, workerCfg.allowedPaths));
     if (workerAllowedPaths.length === 0) {
       return refusal('code worker has an empty allowedPaths baseline; refusing to launch');
     }
@@ -157,8 +163,12 @@ async function dispatch(rule, ctx) {
         const stateOk = validateExistingTaskState(existing, envelope);
         if (!stateOk.ok) return refusal('envelope state does not match persisted task state', { errors: stateOk.errors });
 
-        // Never clobber a live worker: running run + active, unexpired lease.
+        // Never clobber a live worker. An expired lease with a running process is
+        // ambiguous: fail closed and require human recovery.
         const exec = state.activeExecutionState(db, taskId);
+        if (exec.runningRun && exec.activeLease && state.isLeaseExpired(exec.activeLease)) {
+          return refusal('execution state ambiguous: running run has expired lease; human recovery required');
+        }
         if (exec.live) {
           return refusal('task already has an active execution');
         }
@@ -175,6 +185,23 @@ async function dispatch(rule, ctx) {
         if (!ns.ok) return refusal('invalid initial task state', { errors: ns.errors });
       }
 
+      // Bounded repair worker (Hermes) gates (ORCH-098/099). A task that a prior
+      // repair escalated/blocked, or one that has exhausted its attempt budget,
+      // must never be auto-dispatched again — human intervention is required.
+      if (workerCfg.repair) {
+        const maxAttempts = Number(workerCfg.maxAttempts || DEFAULT_MAX_REPAIR_ATTEMPTS);
+        if (existing && (existing.state === 'escalated' || existing.state === 'blocked')) {
+          const reauthorized = ctx.action === 'labeled' && ctx.triggerLabel === 'repair:retry' && (cfg.allowlist || []).includes(ctx.actor) && envelope.state === existing.state;
+          if (!reauthorized) return refusal(`task is '${existing.state}' — autonomous repair requires human re-authorization`);
+        }
+        // The repair budget counts REPAIR attempts only (ORCH-098). Unrelated
+        // planning/implementation runs on the same task must not consume it.
+        if (attemptExceeded(state.nextRepairAttempt(db, taskId), maxAttempts)) {
+          state.updateTaskState(db, taskId, 'escalated');
+          return refusal(`repair attempt limit reached (max ${maxAttempts}); task escalated to human`);
+        }
+      }
+
       // Reservation: no live execution remains, so it is now safe to release any
       // remaining active lease, upsert the task, and reserve a fresh execution.
       state.releaseActiveLeasesForTask(db, taskId);
@@ -187,6 +214,10 @@ async function dispatch(rule, ctx) {
 
       // Prepare a CLEAN named worktree from authoritative Git state; install the
       // path/base guard; create exactly one active lease + one running run.
+      let createdRunStateDir = null;
+      let createdRunHomeContainer = null;
+      let createdLeaseId = null;
+      let createdRunId = null;
       try {
         const prepared = prepareWorktreeForRun({
           sourceRepo, worktreeRoot: cfg.worktreeRoot, taskId, baseSha, branch: envelope.branch,
@@ -194,14 +225,49 @@ async function dispatch(rule, ctx) {
         const wt = prepared.path;
         installPushGuard(wt, { workerAllowedPaths, taskAllowedPaths, baseSha, baseRef });
         const attempt = state.nextAttempt(db, taskId);
+        const repairAttemptN = workerCfg.repair ? state.nextRepairAttempt(db, taskId) : null;
         const rid = crypto.randomUUID();
+        const lid = crypto.randomUUID();
+        if (workerCfg.repair) {
+          const stateRoot = cfg.runStateRoot || CANONICAL_RUN_STATE_ROOT;
+          createdRunStateDir = join(stateRoot, rid);
+          createdRunHomeContainer = join(CANONICAL_HERMES_RUN_HOME_ROOT, rid);
+          const createdRunHome = join(createdRunHomeContainer, 'home');
+          if (existsSync(createdRunStateDir) || existsSync(createdRunHomeContainer)) throw new Error('run state already exists');
+          mkdirSync(createdRunStateDir, { recursive: true, mode: 0o700 });
+          mkdirSync(createdRunHome, { recursive: true, mode: 0o700 });
+          if (workerCfg.testReservationFailure === 'after-run-state') throw new Error('injected reservation failure after run-state creation');
+        }
         state.createLease(db, {
-          id: crypto.randomUUID(), taskId, worktree: wt, baseSha, owner: envelope.agent,
+          id: lid, taskId, worktree: wt, baseSha, owner: envelope.agent,
           sourceRepo, expiresAt: new Date(Date.now() + (cfg.leaseDurationMs || 86400000)).toISOString(),
         });
-        state.createRun(db, { id: rid, taskId, agent: rule.worker, attempt, status: 'running' });
-        return { ok: true, worktree: wt, runId: rid };
+        createdLeaseId = lid;
+        if (workerCfg.testReservationFailure === 'after-lease') throw new Error('injected reservation failure after lease creation');
+        createdRunId = rid;
+        state.createRun(db, { id: rid, taskId, agent: rule.worker, attempt, repairAttempt: repairAttemptN, status: 'running' });
+        return {
+          ok: true, worktree: wt, runId: rid, attempt, repairAttempt: repairAttemptN, leaseId: lid,
+          baseSha, startSha: prepared.startSha,
+          runStateDir: createdRunStateDir,
+          runHome: workerCfg.repair ? join(createdRunHomeContainer, 'home') : null,
+          runHomeContainer: createdRunHomeContainer,
+        };
       } catch (e) {
+        // This reservation did not reach the post-worker finalizer. Remove only
+        // resources created by this attempt, and release only its own lease/run.
+        if (createdRunId) {
+          try { state.updateRun(db, createdRunId, { status: 'failed', result: `reservation failed: ${String(e?.message || e).slice(0, 500)}` }); } catch (persistError) { log(`[router] failed to persist partial run ${createdRunId}: ${persistError.message}`); }
+        }
+        if (createdLeaseId) {
+          try { state.releaseLease(db, createdLeaseId); } catch (releaseError) { log(`[router] failed to release partial lease ${createdLeaseId}: ${releaseError.message}`); }
+        }
+        if (createdRunStateDir) {
+          try { rmSync(createdRunStateDir, { recursive: true, force: true }); } catch (cleanupError) { log(`[router] failed to remove partial run state ${createdRunStateDir}: ${cleanupError.message}`); }
+        }
+        if (createdRunHomeContainer) {
+          try { rmSync(createdRunHomeContainer, { recursive: true, force: true }); } catch (cleanupError) { log(`[router] failed to remove partial run home ${createdRunHomeContainer}: ${cleanupError.message}`); }
+        }
         log(`[router] worktree setup failed for ${taskId}: ${e.message}`);
         state.updateTaskState(db, taskId, 'blocked');
         return refusal('worktree setup failed', { detail: e.message });
@@ -211,6 +277,14 @@ async function dispatch(rule, ctx) {
     if (reservation.refusal) return reservation;
     worktree = reservation.worktree;
     runId = reservation.runId;
+    attempt = reservation.attempt ?? null;
+    repairAttempt = reservation.repairAttempt ?? null;
+    leaseId = reservation.leaseId ?? null;
+    baseSha = reservation.baseSha ?? null;
+    startSha = reservation.startSha ?? null;
+    runStateDir = reservation.runStateDir ?? null;
+    runHome = reservation.runHome ?? null;
+    runHomeContainer = reservation.runHomeContainer ?? null;
   }
 
   const vars = templateVars(ctx, {
@@ -226,20 +300,108 @@ async function dispatch(rule, ctx) {
       : '',
   });
 
+  // Bounded repair workers (Hermes) receive structured task/run/lease context as
+  // explicit SONORAN_* metadata (never free-form env inheritance), plus a result
+  // file path the worker writes its structured outcome to. ORCH-096/097.
+  let repairResultFile = null;
+  if (workerCfg.repair) {
+    repairResultFile = runStateDir ? join(runStateDir, 'repair-result.json') : null;
+    const maxAttempts = Number(workerCfg.maxAttempts || DEFAULT_MAX_REPAIR_ATTEMPTS);
+    const repairMeta = {
+      RUN_ID: runId,
+      RUN_STATE_DIR: runStateDir,
+      RUN_HOME: runHome,
+      LEASE_ID: leaseId,
+      REPO: ctx.repo,
+      BRANCH: envelope?.branch || ctx.branch || '',
+      BASE_SHA: baseSha,
+      ATTEMPT: repairAttempt,
+      MAX_ATTEMPTS: maxAttempts,
+      ALLOWED_PATHS: workerAllowedPaths.join('\n'),
+      TASK_PATHS: taskAllowedPaths.join('\n'),
+      BUILD_CMD: workerCfg.buildCmd || DEFAULT_REPAIR_BUILD_CMD,
+      RESULT_FILE: cfg.testFixtures === true && cfg.devMode === true && workerCfg.testFixture === true
+        ? repairResultFile
+        : '/run/sonoran/repair-result.json',
+      TEST_FIXTURE: cfg.testFixtures === true && cfg.devMode === true && workerCfg.sandboxedTestFixture === true
+        ? 'sandboxed'
+        : '',
+    };
+    vars.meta = repairMeta;
+  }
+
   const program = resolveProgram(workerCfg.program, cfg.__routerDir);
   const args = interpolateArgs(workerCfg.args || [], vars);
   // Never inherit every env var from the router process (ORCH-094): workers get
-  // only an explicit allowlist (PATH/HOME by default) plus their task/worktree.
-  const env = buildWorkerEnv(workerCfg, { taskId, worktree });
+  // only an explicit allowlist (PATH/HOME by default) plus their task/worktree
+  // and (for repair workers) the structured SONORAN_* metadata above.
+  const env = buildWorkerEnv(workerCfg, { taskId, worktree, meta: vars.meta || {} });
 
   const result = await runWorker(workerCfg, {
     program, args, cwd: worktree || cfg.__routerDir, env, timeoutMs: workerCfg.timeoutMs || cfg.defaultTimeoutMs,
   });
 
-  if (runId) state.updateRun(db, runId, { status: result.ok ? 'success' : 'failed', result: (result.stderr || result.stdout || result.error || '').slice(0, 2000) });
-  if (taskId && !result.ok) state.updateTaskState(db, taskId, 'blocked');
+  // Interpret results and persist durable evidence. Cleanup is a true finalizer:
+  // this dispatch releases/removes only the run identity it reserved.
+  let repairRead = null;
+  let repairAction = null;
+  let repairVerification = null;
+  let outcomeOk = result.ok && !workerCfg.repair;
+  let repairOutcomeOk = outcomeOk;
+  try {
+    if (workerCfg.repair) {
+      repairRead = readRepairResult(repairResultFile, { expectedAttempt: repairAttempt });
+      repairAction = classifyRepairResult(repairRead);
+      if (repairAction.action === 'candidate_fix' && repairRead.ok && result.ok) {
+        repairVerification = verifyRepairCandidate({ worktree, expectedBranch: envelope.branch, startSha, workerAllowedPaths, taskAllowedPaths, declaredFiles: repairRead.data.files_changed });
+        if (!repairVerification.ok) repairAction = { action: 'invalid', reason: `post-run Git verification: ${repairVerification.reason}` };
+      }
+    }
+    // `ok` is the HTTP repair-outcome signal: no_fix is structurally valid
+    // worker evidence, but it is not a successful repair.
+    if (workerCfg.repair) {
+      repairOutcomeOk = result.ok && repairRead?.ok === true && repairAction?.action !== 'invalid'
+        && repairAction?.action !== 'no_fix'
+        && (repairAction?.action !== 'candidate_fix' || repairVerification?.ok === true);
+      outcomeOk = repairOutcomeOk;
+    }
+    if (runId) {
+      let runStatus = 'failed';
+      if (workerCfg.repair) {
+        if (repairAction?.action === 'escalate' && result.ok && repairRead?.ok) runStatus = 'escalated';
+        else if (repairAction?.action === 'blocked' && result.ok && repairRead?.ok) runStatus = 'blocked';
+        else if (repairAction?.action === 'candidate_fix' && repairOutcomeOk) runStatus = 'success';
+      } else if (outcomeOk) {
+        runStatus = 'success';
+      }
+      const runResult = workerCfg.repair
+        ? JSON.stringify(buildRepairRecord({ data: repairRead?.ok ? repairRead.data : null, action: repairAction?.action ?? null, error: repairRead?.ok ? (repairVerification?.ok === false ? repairVerification.reason : null) : repairRead.error, attempt: repairAttempt, exitCode: result.code, timedOut: result.timedOut, output: result.stderr || result.stdout || result.error || '' }))
+        : (result.stderr || result.stdout || result.error || '').slice(0, 2000);
+      state.updateRun(db, runId, { status: runStatus, result: runResult });
+    }
+    if (taskId) {
+      if (workerCfg.repair) {
+        if (repairAction?.action === 'escalate') state.updateTaskState(db, taskId, 'escalated');
+        else if (repairAction?.action === 'blocked') state.updateTaskState(db, taskId, 'blocked');
+        else if (!outcomeOk) state.updateTaskState(db, taskId, 'in_progress');
+      } else if (!result.ok) state.updateTaskState(db, taskId, 'blocked');
+    }
+  } catch (e) {
+    outcomeOk = false;
+    const reason = String(e?.message || e).slice(0, 2000);
+    repairAction = { action: 'invalid', reason: `finalization failure: ${reason}` };
+    if (runId) {
+      try {
+        state.updateRun(db, runId, { status: 'failed', result: workerCfg.repair ? JSON.stringify(buildRepairRecord({ action: 'invalid', error: reason, attempt: repairAttempt, exitCode: result.code, timedOut: result.timedOut })) : reason });
+      } catch (persistError) { log(`[router] failed to persist run ${runId}: ${persistError.message}`); }
+    }
+  } finally {
+    if (leaseId) { try { state.releaseLease(db, leaseId); } catch (e) { log(`[router] failed to release lease ${leaseId}: ${e.message}`); } }
+    if (runStateDir) { try { rmSync(runStateDir, { recursive: true, force: true }); } catch (e) { log(`[router] failed to remove run state ${runStateDir}: ${e.message}`); } }
+    if (runHomeContainer) { try { rmSync(runHomeContainer, { recursive: true, force: true }); } catch (e) { log(`[router] failed to remove run home container ${runHomeContainer}: ${e.message}`); } }
+  }
 
-  return { ok: result.ok, taskId, runId, worktree, output: (result.stderr || result.stdout || '').slice(0, 500) };
+  return { ok: outcomeOk, taskId, runId, worktree, attempt, repairAttempt, repairAction: repairAction?.action ?? null, output: (result.stderr || result.stdout || '').slice(0, 500) };
 }
 
 async function handlePost(raw, headers) {
@@ -248,6 +410,7 @@ async function handlePost(raw, headers) {
 
   const ctx = normalize(headers, body);
   if (ctx.event === '' && !cfg.devMode) return { status: 400, json: { error: 'missing X-GitHub-Event' } };
+  if (!ctx.deliveryId && !cfg.devMode) return { status: 400, json: { error: 'missing X-GitHub-Delivery' } };
 
   if (!state.recordDelivery(db, { id: ctx.deliveryId, repo: ctx.repo, event: ctx.event, actor: ctx.actor })) {
     return { status: 200, json: { deduplicated: true } };
@@ -323,13 +486,15 @@ function reapExpired() {
   let reaped = 0;
   for (const lease of state.listExpiredLeases(db, state.now())) {
     try {
+      const running = state.getRunningRunForTask(db, lease.task_id);
+      if (running) { log(`[router] lease ${lease.id} expired while run ${running.id} is still running; refusing reap`); continue; }
       // A stale lease must never remove a worktree that a newer active lease owns.
       if (state.activeLeaseOwnsWorktree(db, { sourceRepo: lease.source_repo, worktree: lease.worktree }, lease.id)) {
         state.releaseLease(db, lease.id);
         log(`[router] not reaping ${lease.id}: worktree still owned by an active lease`);
         continue;
       }
-      removeWorktreePath(lease.source_repo, lease.worktree);
+      removeWorktreePath(lease.source_repo, lease.worktree, cfg.worktreeRoot);
       state.releaseLease(db, lease.id);
       log(`[router] reaped expired lease ${lease.id} (${lease.worktree})`);
       reaped++;

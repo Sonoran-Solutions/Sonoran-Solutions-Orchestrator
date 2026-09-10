@@ -1,7 +1,9 @@
 // lib/worktrees.mjs — per-task git worktree + lease isolation. ORCH-077..083.
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { isAbsolute, join, resolve, sep, dirname } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { containedPath } from './task-id.mjs';
 
 export function runGit(cwd, args) {
   return execFileSync('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] }).toString();
@@ -100,21 +102,67 @@ export function safeBranchName(name) {
   return s;
 }
 
-// Create one named branch + worktree per task (ORCH-077..080). Ownership becomes
-// task <=> branch <=> worktree <=> lease. The worktree is placed on an existing or
-// new named branch and FAILS CLOSED (throws) if that cannot be done — it never
-// falls back to a detached HEAD. Retry/lifecycle policy lives in
-// prepareWorktreeForRun, not here.
+// Worker publication is deliberately unavailable until router-owned publication
+// verification exists (ORCH-080). This URL names no installed Git transport, so
+// `git push origin ...` fails even if a future tool accidentally tries it.
+export const PRIVATE_REPO_PUSH_URL = 'sonoran-no-push://router-owned-publication-required';
+
+function credentialFreeRemoteUrl(raw) {
+  const value = String(raw || '').trim();
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return value;
+  try {
+    const url = new URL(value);
+    url.username = '';
+    url.password = '';
+    return url.href;
+  } catch {
+    throw new Error('source origin URL is invalid');
+  }
+}
+
+// Create one task-private standalone repository per task (ORCH-077..080).
+//
+// A linked worktree cannot be used inside the Hermes filesystem sandbox: its
+// `.git` file points back into the router's shared source repository, which is
+// intentionally invisible. Instead, the router transfers only the verified
+// starting commit into a fresh repository owned by the task, creates the assigned
+// named branch there, and gives the checkout its own refs/index/config/object DB.
+// No alternates or shared object hardlinks are used, and the source repository is
+// never mounted into the worker sandbox.
 export function createWorktree({ sourceRepo, worktreeRoot, taskId, baseSha, branch }) {
-  const dest = join(worktreeRoot, taskId);
+  const dest = containedPath(worktreeRoot, taskId);
   mkdirSync(worktreeRoot, { recursive: true });
   const safeBranch = safeBranchName(branch) || `agent/${taskId}`;
+  const startSha = resolveCommitSha(sourceRepo, baseSha || 'HEAD');
+  if (!startSha) throw new Error(`cannot materialize invalid starting commit '${baseSha || 'HEAD'}'`);
+  if (existsSync(dest)) throw new Error(`task checkout already exists: ${dest}`);
+
   try {
-    runGit(sourceRepo, ['worktree', 'add', '-b', safeBranch, dest, baseSha || 'HEAD']);
-  } catch {
-    // Branch already exists — attach to it. Fail closed: if attach also fails we
-    // must NOT silently fall back to detached HEAD.
-    runGit(sourceRepo, ['worktree', 'add', dest, safeBranch]);
+    mkdirSync(dest, { recursive: false });
+    runGit(dest, ['init', '--quiet']);
+    // file:// forces normal Git object transfer instead of local-clone hardlinks
+    // or alternates. Fetch the exact router-approved commit, not an ambient ref.
+    runGit(dest, ['fetch', '--quiet', '--no-tags', pathToFileURL(sourceRepo).href, startSha]);
+    runGit(dest, ['checkout', '--quiet', '-b', safeBranch, startSha]);
+
+    // Local commits need an identity, but never an owner credential helper.
+    runGit(dest, ['config', '--local', 'user.name', 'Sonoran Hermes Repair Worker']);
+    runGit(dest, ['config', '--local', 'user.email', 'hermes@local']);
+
+    // Retain the authoritative fetch URL for read-only inspection. Remote
+    // publication is explicitly disabled until ORCH-080 is implemented. A source
+    // repository without origin is valid for offline tests, but once origin exists,
+    // adding it and disabling push are both fail-closed setup steps.
+    let origin = '';
+    try { origin = runGit(sourceRepo, ['remote', 'get-url', 'origin']).trim(); }
+    catch { /* no origin */ }
+    if (origin) {
+      runGit(dest, ['remote', 'add', 'origin', credentialFreeRemoteUrl(origin)]);
+      runGit(dest, ['remote', 'set-url', '--push', 'origin', PRIVATE_REPO_PUSH_URL]);
+    }
+  } catch (e) {
+    rmSync(dest, { recursive: true, force: true });
+    throw e;
   }
   return dest;
 }
@@ -146,15 +194,15 @@ export function verifyCleanWorktree(path, branch, startSha) {
 //
 //   - Removes any prior worktree for this task (no stale reuse, no two simultaneous
 //     worktrees for the same task branch).
-//   - If the task branch exists on origin, it is authoritative: the local branch is
-//     reset to the remote tip, but ONLY if the remote branch is compatible with the
+//   - If the task branch exists on origin, it is authoritative: the private checkout
+//     starts at the remote tip, but ONLY if the remote branch is compatible with the
 //     verified base (base is an ancestor). Otherwise it fails closed rather than
 //     inventing an automatic rebase/merge.
 //   - If the task branch is not on origin, it is recreated from the verified base SHA
 //     (any stale local-only commits are discarded).
 //   - Verifies branch / non-detached / clean / starting commit before returning.
 export function prepareWorktreeForRun({ sourceRepo, worktreeRoot, taskId, baseSha, branch }) {
-  const dest = join(worktreeRoot, taskId);
+  const dest = containedPath(worktreeRoot, taskId);
   const safeBranch = safeBranchName(branch) || `agent/${taskId}`;
 
   // 1. Never inherit a prior attempt's worktree state.
@@ -170,19 +218,15 @@ export function prepareWorktreeForRun({ sourceRepo, worktreeRoot, taskId, baseSh
     if (!isAncestor(sourceRepo, baseSha, remoteTrack)) {
       throw new Error(`task branch '${safeBranch}' is not compatible with the current base; explicit rebase/reopen required`);
     }
-    // Reset the local branch to the remote tip so the worker continues from the
-    // remote, not a stale local-only branch.
-    try { runGit(sourceRepo, ['branch', '-f', safeBranch, remoteTrack]); } catch { /* create below if absent */ }
     startSha = remoteTip;
   } else {
-    // Task branch not on origin -> recreate from the verified base, discarding any
-    // stale local-only commits from an earlier run.
-    try { runGit(sourceRepo, ['branch', '-D', safeBranch]); } catch { /* not present */ }
+    // Task branch not on origin -> recreate privately from the verified base,
+    // discarding any stale local-only commits from an earlier run.
     startSha = baseSha;
   }
 
-  // 3. Create the named worktree from the authoritative state.
-  const path = createWorktree({ sourceRepo, worktreeRoot, taskId, baseSha, branch: safeBranch });
+  // 3. Create the named private checkout from the authoritative state.
+  const path = createWorktree({ sourceRepo, worktreeRoot, taskId, baseSha: startSha, branch: safeBranch });
 
   // 4. Verify: expected branch, not detached, clean, at the expected commit.
   verifyCleanWorktree(path, safeBranch, startSha);
@@ -190,19 +234,36 @@ export function prepareWorktreeForRun({ sourceRepo, worktreeRoot, taskId, baseSh
 }
 
 export function removeWorktree({ sourceRepo, worktreeRoot, taskId }) {
-  const dest = join(worktreeRoot, taskId);
+  const dest = containedPath(worktreeRoot, taskId);
   if (!existsSync(dest)) return;
-  try { runGit(sourceRepo, ['worktree', 'remove', '--force', dest]); }
-  catch { runGit(sourceRepo, ['worktree', 'prune']); }
+  const dotgit = join(dest, '.git');
+  // Compatibility cleanup for linked worktrees created by an older router.
+  // New private checkouts (including one whose worker damaged/deleted .git) are
+  // reconstructed by removing only this router-derived task path.
+  if (existsSync(dotgit) && !statSync(dotgit).isDirectory()) {
+    try { runGit(sourceRepo, ['worktree', 'remove', '--force', dest]); }
+    catch { runGit(sourceRepo, ['worktree', 'prune']); }
+    return;
+  }
+  rmSync(dest, { recursive: true, force: true });
 }
 
 // Resolve the real git dir for a worktree (its .git may be a "gitdir:" pointer).
 export function resolveGitDir(worktreePath) {
   const dotgit = join(worktreePath, '.git');
   if (!existsSync(dotgit)) return null;
+  if (statSync(dotgit).isDirectory()) return dotgit;
   const st = readFileSync(dotgit, 'utf8');
   const m = st.match(/^gitdir:\s*(.+)$/m);
-  return m ? join(worktreePath, m[1].trim()) : dotgit;
+  if (!m) return dotgit;
+  const target = m[1].trim();
+  return isAbsolute(target) ? target : resolve(worktreePath, target);
+}
+
+function isPrivateRepository(path) {
+  const dotgit = join(path, '.git');
+  try { return statSync(dotgit).isDirectory(); }
+  catch { return false; }
 }
 
 const PUSH_GUARD = `#!/bin/sh
@@ -213,15 +274,15 @@ const PUSH_GUARD = `#!/bin/sh
 # ask the remote for the base branch's CURRENT tip and compare it to the recorded
 # base SHA. Only the base branch's unexpected movement blocks a push.
 #
-# Allowed-path policy is TWO scopes, both enforced per changed file:
-#   .sonoran-worker-allowed-paths  = worker/repository baseline (MAXIMUM trusted boundary)
-#   .sonoran-task-allowed-paths    = optional task narrowing boundary
+# Allowed-path policy is TWO scopes, both enforced per changed file. Metadata is
+# stored under the private repository's actual git directory, never in checkout content.
 # A file must match the worker baseline AND (when a task scope exists) the task scope.
 # This is a cooperative enforcement layer, not router-owned push verification.
-worker_scope=".sonoran-worker-allowed-paths"
-task_scope=".sonoran-task-allowed-paths"
-base_ref="$(cat .sonoran-base-ref 2>/dev/null | tr -d '[:space:]')"
-base_sha="$(cat .sonoran-base-sha 2>/dev/null | tr -d '[:space:]')"
+gitdir="$(git rev-parse --git-dir 2>/dev/null || printf .git)"
+worker_scope="$gitdir/sonoran/worker-allowed-paths"
+task_scope="$gitdir/sonoran/task-allowed-paths"
+base_ref="$(cat "$gitdir/sonoran/base-ref" 2>/dev/null | tr -d '[:space:]')"
+base_sha="$(cat "$gitdir/sonoran/base-sha" 2>/dev/null | tr -d '[:space:]')"
 zero="0000000000000000000000000000000000000000"
 # Normalize to a full ref path so both the remote query and the "don't push to base"
 # comparison work whether we stored "main" or "refs/heads/main".
@@ -296,20 +357,23 @@ exit 0
 export function installPushGuard(worktreePath, { workerAllowedPaths = [], taskAllowedPaths = [], baseSha = '', baseRef = '' } = {}) {
   const gitdir = resolveGitDir(worktreePath);
   if (!gitdir) return;
-  writeFileSync(join(worktreePath, '.sonoran-worker-allowed-paths'), (workerAllowedPaths || []).join('\n') + '\n');
-  const taskFile = join(worktreePath, '.sonoran-task-allowed-paths');
+  const metadataDir = join(gitdir, 'sonoran');
+  mkdirSync(metadataDir, { recursive: true, mode: 0o700 });
+  const workerData = (workerAllowedPaths || []).join('\n') + '\n';
+  writeFileSync(join(metadataDir, 'worker-allowed-paths'), workerData, { mode: 0o600 });
+  const taskFile = join(metadataDir, 'task-allowed-paths');
   if (Array.isArray(taskAllowedPaths) && taskAllowedPaths.length) {
-    writeFileSync(taskFile, taskAllowedPaths.join('\n') + '\n');
+    writeFileSync(taskFile, taskAllowedPaths.join('\n') + '\n', { mode: 0o600 });
   } else {
     // No task narrowing supplied: remove any stale task-scope restriction so the
     // guard falls back to worker-baseline-only (not an accidental deny-all).
     try { rmSync(taskFile, { force: true }); } catch { /* already absent */ }
   }
   if (baseSha) {
-    writeFileSync(join(worktreePath, '.sonoran-base-sha'), baseSha + '\n');
+    writeFileSync(join(metadataDir, 'base-sha'), baseSha + '\n', { mode: 0o600 });
   }
   if (baseRef) {
-    writeFileSync(join(worktreePath, '.sonoran-base-ref'), baseRef + '\n');
+    writeFileSync(join(metadataDir, 'base-ref'), baseRef + '\n', { mode: 0o600 });
   }
   const hooksDir = join(gitdir, 'hooks');
   mkdirSync(hooksDir, { recursive: true });
@@ -317,8 +381,18 @@ export function installPushGuard(worktreePath, { workerAllowedPaths = [], taskAl
 }
 
 // Remove a worktree by explicit source repo + path (used by the lease reaper).
-export function removeWorktreePath(sourceRepo, worktreePath) {
-  if (!existsSync(worktreePath)) return;
+export function removeWorktreePath(sourceRepo, worktreePath, worktreeRoot) {
+  if (!worktreeRoot) throw new Error('configured worktree root is required');
+  const root = resolve(worktreeRoot);
+  const candidate = resolve(worktreePath);
+  if (candidate === root || !candidate.startsWith(root + sep)) throw new Error('worktree path escapes configured root');
+  if (!existsSync(candidate)) return;
+  worktreePath = candidate;
+  if (isPrivateRepository(worktreePath)) {
+    rmSync(worktreePath, { recursive: true, force: true });
+    return;
+  }
+  // Compatibility cleanup for linked worktrees created by an older router.
   try { runGit(sourceRepo, ['worktree', 'remove', '--force', worktreePath]); }
   catch { runGit(sourceRepo, ['worktree', 'prune']); }
 }

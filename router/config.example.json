@@ -10,6 +10,7 @@
   "githubSecretEnv": "GITHUB_WEBHOOK_SECRET",
   "slackWebhookEnv": "SLACK_WEBHOOK_URL",
   "stateDb": "state.sqlite",
+  "runStateRoot": "/home/dq/.local/state/sonoran-orchestrator/runs",
   "reposRoot": "/home/dq/sonoran-checkouts",
   "worktreeRoot": "/home/dq/sonoran-worktrees",
   "repoBase": "https://github.com",
@@ -28,6 +29,16 @@
       "createsTask": true,
       "allowedPaths": ["app/src/**", "native/**", "*.md"],
       "envAllowlist": ["PATH", "HOME"]
+    },
+    "hermes": {
+      "program": "../hermes-watch/run-hermes-sandboxed",
+      "args": ["-z", "{{prompt}}", "--in", "{{worktree}}", "--skills", "fix-build", "--yolo"],
+      "createsTask": true,
+      "repair": true,
+      "maxAttempts": 3,
+      "buildCmd": "./ci.sh test",
+      "allowedPaths": ["app/src/**", "native/**", "*.md"],
+      "envAllowlist": ["PATH", "HOME"]
     }
   },
   "rules": [
@@ -36,6 +47,12 @@
       "when": { "events": ["pull_request"], "actions": ["opened"] },
       "worker": "notify",
       "authorize": "trusted"
+    },
+    {
+      "id": "hermes-repair-on-label",
+      "when": { "events": ["issues", "pull_request"], "actions": ["labeled"], "labels": ["agent:ready", "repair"] },
+      "worker": "hermes",
+      "authorize": "label"
     },
     {
       "id": "codex-on-ready-label",
