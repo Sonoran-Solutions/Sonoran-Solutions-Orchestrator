@@ -296,3 +296,22 @@ filtering, and offline HTTP integration tests (HMAC/auth/dedupe/422 gates, a ful
 issues:labeled code task that honors lifecycle + path policy, a PR-context
 branch-mismatch refusal, and a concurrent test proving a live worker is never
 clobbered by a second delivery).
+
+
+## Quick verification
+
+The portable router test command is:
+
+```bash
+cd router
+node test.mjs
+```
+
+The Linux host/runtime sandbox test is:
+
+```bash
+bash hermes-watch/sandbox-test.sh
+```
+
+The router suite is portable, while the full sandbox test depends on the
+configured Linux host environment.
