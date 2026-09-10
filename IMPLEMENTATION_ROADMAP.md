@@ -6,15 +6,30 @@
 
 **Rule:** do not advance a phase because the infrastructure looks cool. Advance only when the previous phase works on a real task and is making the workflow clearer, safer, or faster.
 
-M2.2 retains completed candidate checkouts for review. M2.4 must define their
-retention and garbage-collection policy as part of publication/rejection; the
-stale active-lease reaper must not delete released candidate artifacts.
+---
+
+## Current position — September 2026
+
+**Active milestone: M2.3 — deliberate Hermes repair tests.**
+
+- ✅ **M1.5 control plane:** complete for the pilot except **ORCH-080**, which is intentionally deferred until router-owned publication in M2.4.
+- ✅ **M2.1 canonical DualDex CI:** complete; `./ci.sh test`, `./ci.sh build`, and `./ci.sh all` are the contract, and the pilot branch ruleset requires `Native & Unit Tests` and `Build Debug APK`.
+- ✅ **M2.2 Hermes setup:** complete and merged via Orchestrator PR #8. Hermes runs in a task-private checkout with per-run HOME/state, Bubblewrap filesystem isolation, private `pasta` networking, private-range denial, bounded repair attempts, router-owned post-run Git verification, and durable structured evidence.
+- ✅ **F-09 deterministic real-boundary fixture:** complete. Synthetic HTTP traverses the real router → production sandbox → local candidate commit/result → verifier → SQLite → cleanup without calling an LLM.
+- ➡️ **Next:** configure a dedicated low-privilege inference credential, then run ORCH-100 through ORCH-105 using real Hermes/model calls.
+- ⬜ **M2.4 publication/review:** not started. Hermes still has no push authority; completed candidate checkouts are retained until M2.4 defines publication/rejection retention and garbage collection.
+- ⬜ **Evaluation Gate:** required before M3.
+
+Before ORCH-100, do two small prerequisites rather than opening another architecture phase:
+
+1. Add a minimal Orchestrator GitHub Actions workflow so portable router tests are reproduced on GitHub instead of existing only as local evidence.
+2. Configure Hermes provider authentication with a dedicated, budget-limited credential that is available only inside the repair worker boundary. Do not expose owner Git/GitHub credentials or broaden filesystem/network access to accomplish model authentication.
 
 ---
 
 ## Status legend
 
-- [ ] Not started
+- [ ] Not started / still required
 - [x] Complete
 - **GATE** — stop and evaluate before continuing
 
@@ -28,42 +43,37 @@ Suggested issue/task IDs use `ORCH-###` so they can later be copied into GitHub 
 
 ### P0.1 — Sonoran Solutions identity
 
-- [ ] **ORCH-001** Complete the planned GitHub identity rename to the final Sonoran Solutions username before configuring long-lived external integrations.
-- [ ] **ORCH-002** Verify this orchestrator repo and DualDex resolve correctly after the rename.
-- [ ] **ORCH-003** Search orchestration/config/docs for hard-coded `devils-17` repository references and update them.
+- [x] **ORCH-001** Complete the GitHub identity rename to the final Sonoran Solutions namespace.
+- [x] **ORCH-002** Verify this orchestrator repo and DualDex resolve correctly under Sonoran Solutions.
+- [x] **ORCH-003** Search orchestration/config/docs for hard-coded `devils-17` repository references and update them.
 - [ ] **ORCH-004** Re-check GitHub Actions, webhooks, badges, remotes, Slack links, and any tokens/integrations that may reference the old namespace.
 
 ### P0.2 — Decide the pilot boundary
 
-- [ ] **ORCH-005** Select **one real, low-risk DualDex issue** for the first end-to-end benchmark.
-- [ ] **ORCH-006** Write explicit acceptance criteria for that issue.
-- [ ] **ORCH-007** Record the current/manual workflow so the orchestrator has something to beat.
-- [ ] **ORCH-008** Declare SaveBridge and Dungeon Dispatcher **out of scope for orchestration testing** until the DualDex pilot passes M2.
+- [ ] **ORCH-005** Human-confirm **one real, low-risk DualDex issue** for the first end-to-end benchmark. A candidate and pilot document already exist; final human choice remains.
+- [x] **ORCH-006** Write explicit acceptance criteria for the pilot issue.
+- [x] **ORCH-007** Record the current/manual workflow so the orchestrator has something to beat.
+- [ ] **ORCH-008** Formally record SaveBridge and Dungeon Dispatcher as out of scope for orchestration testing until the DualDex pilot passes M2.
 
 ### P0 exit criteria
 
 - GitHub identity is stable enough to wire integrations.
-- One DualDex pilot task is selected.
+- One DualDex pilot task is human-confirmed.
 - Success criteria are known before automation begins.
 
 ---
 
 # Phase M0 — Manual role benchmark
 
-**Goal:** prove that the proposed employee/role split produces better work before automating handoffs.
+**Goal:** preserve a baseline for whether multi-agent handoffs are actually better than working normally.
 
-No daemon/router automation is required in this phase.
+No daemon/router automation is required in this phase. This phase is partially complete historically and is not the active implementation milestone, but its benchmark data is still needed for the Evaluation Gate.
 
 ### M0.1 — Codex planning pass
 
-- [ ] **ORCH-010** Give Codex the selected DualDex issue.
-- [ ] **ORCH-011** Have Codex produce:
-  - scoped task statement;
-  - acceptance criteria;
-  - likely files/components;
-  - known risks/non-goals;
-  - test plan.
-- [ ] **ORCH-012** Confirm the plan does not unnecessarily expand scope.
+- [ ] **ORCH-010** Give Codex the human-confirmed DualDex pilot issue.
+- [x] **ORCH-011** Produce a planning-pass artifact with scope, acceptance criteria, likely files/components, risks/non-goals, and test plan.
+- [ ] **ORCH-012** Confirm the plan does not unnecessarily expand scope for the final chosen pilot issue.
 
 ### M0.2 — Antigravity implementation pass
 
@@ -75,7 +85,7 @@ No daemon/router automation is required in this phase.
 
 - [ ] **ORCH-016** Have Codex review the actual diff against the acceptance criteria.
 - [ ] **ORCH-017** Fix review findings manually or with the appropriate agent.
-- [ ] **ORCH-018** Run the repo's current build/tests.
+- [ ] **ORCH-018** Run the repo's canonical build/tests.
 - [ ] **ORCH-019** Human-review and merge the pilot PR if correct.
 
 ### M0.4 — Benchmark notes
@@ -83,7 +93,7 @@ No daemon/router automation is required in this phase.
 - [ ] **ORCH-020** Record where context was lost between agents.
 - [ ] **ORCH-021** Record which role assignment felt forced or redundant.
 - [ ] **ORCH-022** Record approximate human intervention points.
-- [ ] **ORCH-023** Decide whether Codex → Antigravity → Codex is actually useful enough to automate.
+- [ ] **ORCH-023** Decide whether Codex → implementation worker → Codex is actually useful enough to automate.
 
 ### M0 exit criteria
 
@@ -91,7 +101,7 @@ No daemon/router automation is required in this phase.
 - The role split is useful enough to keep.
 - Known handoff information requirements are documented.
 
-**GATE:** if manual multi-agent handoff creates more overhead than doing the task normally, simplify the role model before building the router.
+**GATE:** if manual multi-agent handoff creates more overhead than doing the task normally, simplify the role model before expanding automation.
 
 ---
 
@@ -104,24 +114,19 @@ No daemon/router automation is required in this phase.
 - [ ] **ORCH-030** Keep `#dual-dex` as the DualDex project channel.
 - [ ] **ORCH-031** Create `#agent-ops` for orchestrator-wide failures/alerts when needed.
 - [ ] **ORCH-032** Repurpose/archive generic placeholder channels that will not be used.
-- [ ] **ORCH-033** Do **not** create separate `#codex`, `#hermes`, or `#antigravity` channels; organize around projects.
+- [ ] **ORCH-033** Do **not** create separate `#codex`, `#hermes`, or worker-specific channels; organize around projects.
 
 ### M1.2 — Notification policy
 
-- [ ] **ORCH-034** Define the only default top-level project events:
-  - task assigned/started;
-  - PR ready/verification started;
-  - blocked/escalated;
-  - completed/merged;
-  - stopped/cancelled.
-- [ ] **ORCH-035** Remove/disable default notifications for every file edit/tool call.
+- [x] **ORCH-034** Define the default top-level project events: task assigned/started; PR ready/verification started; blocked/escalated; completed/merged; stopped/cancelled.
+- [x] **ORCH-035** Remove/disable default notifications for every file edit/tool call.
 - [ ] **ORCH-036** Use a single Slack thread per GitHub issue/PR when detailed discussion is useful.
 
 ### M1.3 — Secret/config cleanup
 
-- [ ] **ORCH-037** Move Slack webhook/config ownership outside agent-controlled repository worktrees.
-- [ ] **ORCH-038** Stop sourcing arbitrary task-repository `.env` files as executable Bash configuration.
-- [ ] **ORCH-039** Confirm `.env`, tokens, webhook URLs, and local config cannot be committed.
+- [x] **ORCH-037** Move Slack webhook/config ownership outside agent-controlled repository worktrees.
+- [x] **ORCH-038** Stop sourcing arbitrary task-repository `.env` files as executable Bash configuration.
+- [x] **ORCH-039** Confirm `.env`, tokens, webhook URLs, and local config cannot be committed through the normal worker path.
 
 ### M1.4 — GitHub → Slack smoke test
 
@@ -134,107 +139,76 @@ No daemon/router automation is required in this phase.
 
 - A real DualDex PR can produce useful Slack visibility.
 - Slack is readable rather than noisy.
-- No untrusted Slack/GitHub message launches an agent yet.
+- No untrusted Slack/GitHub message launches an agent.
 
 ---
 
 # Phase M1.5 — Safety and control plane
 
-**Goal:** make unattended dispatch technically safe enough to test.
+**Status: pilot control-plane requirements complete except ORCH-080 publication authority.**
 
-This phase is intentionally before Hermes/autonomous handoffs.
+**Goal:** make unattended dispatch technically safe enough to test.
 
 ## M1.5.1 — Router event model
 
-- [ ] **ORCH-050** Add a normalized event context containing at least:
-  - GitHub delivery ID;
-  - event/action;
-  - repository;
-  - issue/PR number;
-  - actor;
-  - branch;
-  - head/base SHA;
-  - labels/authorization facts.
-- [ ] **ORCH-051** Add a request-body size limit.
-- [ ] **ORCH-052** Add dispatch/execution timeout support.
-- [ ] **ORCH-053** Add cancellation/clean shutdown behavior.
-- [ ] **ORCH-054** Add a per-repo/task concurrency limit.
+- [x] **ORCH-050** Add normalized event context: delivery ID, event/action, repo, issue/PR, actor, branch, head/base SHA, labels/authorization facts.
+- [x] **ORCH-051** Add a request-body size limit.
+- [x] **ORCH-052** Add dispatch/execution timeout support.
+- [x] **ORCH-053** Add cancellation/clean shutdown behavior.
+- [x] **ORCH-054** Add per-task concurrency protection / single-live-execution semantics.
 
 ## M1.5.2 — Webhook security
 
-- [ ] **ORCH-055** Make valid GitHub signature verification mandatory outside explicit local-dev mode.
-- [ ] **ORCH-056** Reject missing/invalid signatures.
-- [ ] **ORCH-057** Store GitHub delivery IDs and make duplicate deliveries idempotent.
+- [x] **ORCH-055** Make valid GitHub signature verification mandatory outside explicit local-dev mode.
+- [x] **ORCH-056** Reject missing/invalid signatures.
+- [x] **ORCH-057** Store GitHub delivery IDs and make duplicate deliveries idempotent.
 
 ## M1.5.3 — Safe process dispatch
 
-- [ ] **ORCH-058** Remove webhook-derived command strings executed with `shell: true`.
-- [ ] **ORCH-059** Define worker executables as fixed configuration.
-- [ ] **ORCH-060** Pass validated structured values as argument arrays with `shell: false`.
-- [ ] **ORCH-061** Add tests proving malicious branch/user/issue strings cannot become shell syntax.
+- [x] **ORCH-058** Remove webhook-derived command strings executed with `shell: true`.
+- [x] **ORCH-059** Define worker executables as fixed configuration.
+- [x] **ORCH-060** Pass validated structured values as argument arrays with `shell: false`.
+- [x] **ORCH-061** Add tests proving malicious branch/user/issue strings cannot become shell syntax.
 
 ## M1.5.4 — Authorization gate
 
-- [ ] **ORCH-062** Implement trusted-user allowlist support.
-- [ ] **ORCH-063** Implement `agent:ready` (or equivalent) label authorization.
-- [ ] **ORCH-064** Require the authorizing label/action to come from a trusted actor.
-- [ ] **ORCH-065** Verify a random public issue cannot launch a worker.
-- [ ] **ORCH-066** Log authorization decisions without logging secrets.
+- [x] **ORCH-062** Implement trusted-user allowlist support.
+- [x] **ORCH-063** Implement `agent:ready` (or equivalent) label authorization.
+- [x] **ORCH-064** Require the authorizing label/action to come from a trusted actor.
+- [x] **ORCH-065** Verify a random public issue cannot launch a worker.
+- [x] **ORCH-066** Log authorization decisions without logging secrets.
 
 ## M1.5.5 — SQLite state store
 
-- [ ] **ORCH-067** Add SQLite to the router.
-- [ ] **ORCH-068** Create a `tasks` table with:
-  - task ID;
-  - repo/issue;
-  - current state;
-  - current owner;
-  - branch/base SHA;
-  - risk;
-  - timestamps.
-- [ ] **ORCH-069** Create a `runs` table with:
-  - run ID;
-  - task ID;
-  - agent;
-  - attempt;
-  - start/end status;
-  - last error/result.
-- [ ] **ORCH-070** Create a `deliveries` table for webhook deduplication.
-- [ ] **ORCH-071** Create a `leases` table for worktree ownership.
-- [ ] **ORCH-072** Verify router restart preserves task state and does not re-run completed deliveries.
+- [x] **ORCH-067** Add SQLite to the router.
+- [x] **ORCH-068** Create durable task state.
+- [x] **ORCH-069** Create durable run state, including repair-specific attempt accounting.
+- [x] **ORCH-070** Create delivery deduplication state.
+- [x] **ORCH-071** Create lease state for worktree ownership.
+- [x] **ORCH-072** Verify router restart preserves durable state and completed deliveries do not re-run.
 
 ## M1.5.6 — Handoff parser/validator
 
-- [ ] **ORCH-073** Implement `schema_version: 1` parsing for `handoff/handoff-envelope.md`.
-- [ ] **ORCH-074** Validate required fields and legal state transitions.
-- [ ] **ORCH-075** Treat prose outside the envelope as untrusted context.
-- [ ] **ORCH-076** Add fixtures/tests for:
-  - valid envelope;
-  - missing fields;
-  - unknown schema version;
-  - malicious task text;
-  - stale base SHA;
-  - expired lease;
-  - out-of-scope paths;
-  - exceeded attempts.
+- [x] **ORCH-073** Implement `schema_version: 1` parsing for `handoff/handoff-envelope.md`.
+- [x] **ORCH-074** Validate required fields and legal state transitions.
+- [x] **ORCH-075** Treat prose outside the envelope as untrusted context.
+- [x] **ORCH-076** Add adversarial fixtures for invalid/malicious/stale/out-of-scope/exceeded-attempt inputs.
 
 ## M1.5.7 — Worktree + lease isolation
 
-- [x] **ORCH-077** Define the local worktree root outside the orchestrator source checkout. (`worktreeRoot` config)
-- [x] **ORCH-078** Create one task-private standalone Git checkout per task/lease (private refs/index/config/objects; no shared alternates or linked-worktree metadata).
-- [x] **ORCH-079** Record worktree path + base SHA + owner in SQLite. (`leases` table)
-- [ ] **ORCH-080** Verify lease ownership before commit/push. (still open: the pre-push guard is a *cooperative* layer and does not yet confirm the pusher holds the active lease; router-owned push verification does not exist)
-- [x] **ORCH-081** Stop/escalate if the branch moved unexpectedly. (pre-push guard compares the live remote base tip against the recorded base SHA, independent of the pushed ref; `resolveBaseSha` tracks the live remote tip and refuses a stale provided base)
-- [x] **ORCH-082** Enforce `allowed_paths` before commit/push. (worker/repository baseline REQUIRED AND optional task scope enforced per file; task cannot widen the worker baseline; an omitted task scope means worker-baseline-only, and a stale task-scope file is removed)
-- [x] **ORCH-083** Clean/reap expired task checkouts safely. (periodic `reapExpired()` in `server.mjs`; a stale lease never reaps a worktree a newer active lease owns)
-- [x] **ORCH-140 (lifecycle groundwork)** Retries reconstruct a clean task-private repository from authoritative Git state (`prepareWorktreeForRun`); incompatible remote task branches fail closed rather than auto-rebasing. (full M3.3 review/verification automation remains)
-- [x] **Single live execution per task** — a delivery that finds a run still `running` + an active, unexpired lease is refused (`task already has an active execution`) and never releases the lease/checkout/launches a second worker; stale `running` runs are reconciled to `abandoned`. Serialized per task with an in-process lock. The handoff envelope's `state` must equal persisted task state for existing tasks (fail closed on mismatch).
+- [x] **ORCH-077** Define the local worktree root outside the orchestrator source checkout.
+- [x] **ORCH-078** Create one task-private standalone Git checkout per task/lease with private refs/index/config/objects.
+- [x] **ORCH-079** Record worktree path + base SHA + owner in SQLite.
+- [ ] **ORCH-080** Verify lease ownership before router-owned commit/push. **Intentionally open until M2.4; workers currently cannot push.**
+- [x] **ORCH-081** Stop/escalate if the authoritative base/branch moved unexpectedly.
+- [x] **ORCH-082** Enforce worker-baseline AND optional task `allowed_paths` scope through router-owned verification.
+- [x] **ORCH-083** Clean/reap expired active task checkouts safely without deleting a newer/live execution.
+- [x] **ORCH-140 (lifecycle groundwork)** Retries reconstruct clean task-private repositories from authoritative Git state; incompatible branches fail closed.
+- [x] **Single live execution per task** — live/ambiguous execution states refuse redispatch rather than clobbering another worker.
 
 ### M1.5 exit criteria
 
-A signed, authorized test event can create **exactly one** durable task/run and isolated task-private checkout. Duplicate/untrusted/malicious events cannot launch arbitrary commands or duplicate work.
-
-**GATE:** do not connect an autonomous code-editing worker until this phase passes.
+**Passed for autonomous local repair testing.** Signed/authorized events create exactly one durable isolated execution; duplicate/untrusted/malicious inputs fail closed. Publication authority remains deliberately absent until M2.4.
 
 ---
 
@@ -242,53 +216,66 @@ A signed, authorized test event can create **exactly one** durable task/run and 
 
 **Goal:** prove bounded autonomous repair while keeping CI and merge authority independent from Hermes.
 
-## M2.1 — Define the DualDex CI contract
+## M2.1 — Define the DualDex CI contract — COMPLETE
 
-- [x] **ORCH-090** Choose canonical build command(s): `./ci.sh build` / `./ci.sh test` / `./ci.sh all` (merged in DualDex #28).
-- [x] **ORCH-091** Make the commands deterministic/non-interactive.
-- [x] **ORCH-092** Ensure a developer/agent can run them locally.
-- [x] **ORCH-093** Add/update GitHub Actions to run the same CI contract (`Native & Unit Tests`, `Build Debug APK`).
-- [x] **ORCH-094** Configure required checks for the pilot PR flow (DualDex `protect-main` ruleset, verified by read-back).
+- [x] **ORCH-090** Canonical commands: `./ci.sh build`, `./ci.sh test`, `./ci.sh all` (DualDex PR #28).
+- [x] **ORCH-091** Commands are deterministic/non-interactive.
+- [x] **ORCH-092** Developer/agent can run the same commands locally.
+- [x] **ORCH-093** GitHub Actions runs the same CI contract (`Native & Unit Tests`, `Build Debug APK`).
+- [x] **ORCH-094** Pilot branch/ruleset requires those checks and blocks force-push/deletion; human merge remains authoritative.
 
-## M2.2 — Hermes setup
+## M2.2 — Hermes setup — COMPLETE / MERGED
 
-- [x] **ORCH-095** Install/configure Hermes on the self-hosted machine (`hermes-agent` v0.21.1, `~/.hermes`).
-- [x] **ORCH-096** Give Hermes only the task-private checkout and minimum required environment (structured `SONORAN_*` metadata + env allowlist); use a supervised `pasta` private network namespace plus immutable nftables private-range denial while allowing public DNS/HTTPS transport.
-- [x] **ORCH-097** Update the fix-build skill to consume task/run/lease scope from the router (structured result file contract).
-- [x] **ORCH-098** Set a bounded repair limit (control-plane enforced `maxAttempts: 3`; attempt 4 refused).
-- [x] **ORCH-099** Require escalation for API/schema/product/security decisions (`escalate`/`blocked` stop the autonomous loop).
+Merged through Orchestrator PR #8 after adversarial review and remediation.
 
-Deterministic boundary fixture F-09 is complete: synthetic HTTP traverses the
-real router, production sandbox, external result channel, verifier, durable
-SQLite evidence, and cleanup. It replaces the model with a dev-gated fixed
-command and does not begin the real autonomous repairs in M2.3. ORCH-080 remains
-open; no candidate push occurs.
+- [x] **ORCH-095** Install/configure Hermes on the self-hosted machine (`hermes-agent` v0.21.1).
+- [x] **ORCH-096** Give Hermes only the task-private checkout and minimum environment; isolate filesystem/process state and use supervised `pasta` networking with namespace-local private-range denial while allowing public DNS/HTTPS.
+- [x] **ORCH-097** Fix-build skill consumes router-owned task/run/lease scope and emits a bounded structured result file.
+- [x] **ORCH-098** Enforce repair `maxAttempts: 3`; attempt 4 never launches, including after `repair:retry`.
+- [x] **ORCH-099** Require escalation/blocked state for API/schema/product/security and other human-decision boundaries.
 
-## M2.3 — Deliberate failure tests
+Additional M2.2 evidence now on `main`:
 
-Create controlled failures rather than trusting the first real incident.
+- per-run HOME and run-state isolation;
+- no worker owner Git/GitHub/SSH credentials and no worker push authority;
+- router-owned post-run Git verification in a separate network-disabled verifier sandbox;
+- hostile Git configuration, fsmonitor, replacement-object, dirty-tree, path-scope, and result-spoofing regressions;
+- bounded verifier execution/output;
+- `no_fix` is a failed consumed repair attempt, not success;
+- trusted `repair:retry` never resets the three-attempt budget;
+- F-09 real deterministic boundary fixture proves HTTP → router → private checkout → production sandbox → external result → verifier → SQLite → cleanup without an LLM.
 
-- [ ] **ORCH-100** Test: trivial compile/syntax failure Hermes should fix.
-- [ ] **ORCH-101** Test: narrow failing unit test with an obvious implementation bug.
-- [ ] **ORCH-102** Test: proposed fix makes more tests fail → attempt is reverted.
-- [ ] **ORCH-103** Test: failure requires behavior/API decision → Hermes escalates without guessing.
-- [ ] **ORCH-104** Test: failure cannot be fixed within max attempts → Hermes stops/escalates.
-- [ ] **ORCH-105** Test: Hermes local run passes but GitHub Actions fails → CI remains authoritative and task is not marked done.
+Completed candidate checkouts remain retained for review. M2.4 must define their retention/garbage-collection policy as part of publication/rejection; the stale active-lease reaper must not delete released candidate artifacts.
+
+## M2.3 — Deliberate failure tests — CURRENT
+
+Create controlled failures rather than trusting the first real incident. These are the first tests that use a real inference provider/model.
+
+**M2.3 prerequisites:** dedicated low-privilege/budget-limited provider authentication; recommended small Orchestrator GitHub Actions smoke workflow for portable router tests.
+
+- [ ] **ORCH-100** Trivial compile/syntax failure Hermes should fix.
+- [ ] **ORCH-101** Narrow failing unit test with an obvious implementation bug.
+- [ ] **ORCH-102** Proposed fix makes more tests fail → bad attempt is discarded/reconstructed rather than becoming the accepted candidate.
+- [ ] **ORCH-103** Failure requires behavior/API decision → Hermes escalates without guessing.
+- [ ] **ORCH-104** Failure cannot be fixed within max attempts → Hermes stops/escalates after the bounded budget.
+- [ ] **ORCH-105** Hermes local run passes but GitHub Actions fails → CI remains authoritative and task is not marked done.
 
 ## M2.4 — Review + merge policy
 
-- [ ] **ORCH-106** Hermes pushes candidate repair to the assigned task branch/PR.
-- [ ] **ORCH-107** Codex reviews the candidate repair.
+- [ ] **ORCH-106** Router publishes the verified Hermes candidate to the assigned task branch/PR; finish ORCH-080 as part of this authority boundary.
+- [ ] **ORCH-107** Codex/senior reviewer reviews the actual candidate diff.
 - [ ] **ORCH-108** GitHub Actions verifies required checks.
 - [ ] **ORCH-109** Human performs the merge.
-- [ ] **ORCH-110** Keep all automatic merge behavior disabled during the pilot.
+- [ ] **ORCH-110** Keep automatic merge disabled during the pilot.
+- [ ] Define completed-candidate checkout retention/garbage collection after publication/rejection.
 
 ### M2 exit criteria
 
-- Hermes can fix at least one deliberate mechanical failure.
+- Hermes fixes at least one deliberate mechanical failure with a real model.
 - Hermes correctly refuses/escalates at least one non-mechanical failure.
 - GitHub Actions, not Hermes, determines required-check status.
-- No automatic agent merge is required.
+- Candidate publication is router-owned and lease-verified; the worker never receives merge authority.
+- Human merge remains required.
 
 ---
 
@@ -307,7 +294,7 @@ Create controlled failures rather than trusting the first real incident.
 
 - [ ] **Continue:** clear productivity/visibility/safety benefit → proceed to M3.
 - [ ] **Simplify:** useful pieces exist but full stack is too heavy → keep CI/Slack/worktrees and remove unnecessary agents.
-- [ ] **Pause:** orchestration maintenance exceeds the benefit → return effort to SaveBridge and revisit later.
+- [ ] **Pause:** orchestration maintenance exceeds the benefit → return effort to product work and revisit later.
 
 ---
 
@@ -315,64 +302,39 @@ Create controlled failures rather than trusting the first real incident.
 
 **Goal:** automate the boring baton passing after the control plane is proven.
 
-## M3.1 — Codex planner automation
+## M3.1 — Planner automation
 
 - [ ] **ORCH-130** Authorize a task through the trusted gate.
-- [ ] **ORCH-131** Router dispatches a planning run to Codex.
-- [ ] **ORCH-132** Codex updates the validated envelope with acceptance criteria/scope.
-- [ ] **ORCH-133** Router validates the envelope before moving to implementation.
+- [ ] **ORCH-131** Router dispatches a planning run to the configured planning worker.
+- [ ] **ORCH-132** Planner updates the validated envelope with acceptance criteria/scope.
+- [ ] **ORCH-133** Router validates the envelope before implementation.
 
 ## M3.2 — Implementation handoff
 
 - [ ] **ORCH-134** Router creates the implementation worktree/lease.
 - [ ] **ORCH-135** Post one `ready for implementation` event to the project Slack channel.
-- [ ] **ORCH-136** Keep Antigravity human-steered initially.
-- [ ] **ORCH-137** Only experiment with headless Antigravity after the manual path is reliable.
+- [ ] **ORCH-136** Keep the primary implementation worker human-steered initially.
+- [ ] **ORCH-137** Only experiment with headless implementation after the manual path is reliable.
 
 ## M3.3 — Review + verification automation
 
 - [ ] **ORCH-138** Implementation completion moves task to `review`.
-- [ ] **ORCH-139** Codex receives a review run against the actual diff.
+- [ ] **ORCH-139** Reviewer receives a review run against the actual diff.
 - [ ] **ORCH-140** Required fixes return to the appropriate worker with a new run ID/lease.
 - [ ] **ORCH-141** Accepted review moves task to `verification`.
 - [ ] **ORCH-142** Required GitHub Actions checks gate completion.
-- [ ] **ORCH-143** Human merge marks the initial M3 task `done`.
+- [ ] **ORCH-143** Human merge marks the task `done`.
 
 ## M3.4 — Capability-tier model router
 
-**Goal:** turn the policy in [`MODEL_ROUTING.md`](MODEL_ROUTING.md) into deterministic, provider-neutral routing behavior. The router should choose the cheapest capable worker, preserve evidence between attempts, escalate only for a reason, and step back down once the hard unknown is resolved.
+**Goal:** turn [`MODEL_ROUTING.md`](MODEL_ROUTING.md) into deterministic, provider-neutral routing behavior. Choose the cheapest capable worker, preserve evidence between attempts, escalate only for a reason, and step back down once the hard unknown is resolved.
 
-- [ ] **ORCH-144** Extend task/run metadata and the handoff schema with provider-neutral routing fields such as:
-  - `work_class`;
-  - `capability_tier`;
-  - `max_capability_tier`;
-  - `preferred_worker` / optional provider preference;
-  - `fallback_tier`;
-  - `evidence_packet_ref`;
-  - budget and human-approval requirements where applicable.
-- [ ] **ORCH-145** Add a configurable model/worker registry mapping capability tiers to the currently available providers, models, harnesses, tool access, and cost policy. Durable task state must describe required capability rather than hard-code a permanent model name.
-- [ ] **ORCH-146** Implement a deterministic routing decision engine that selects the cheapest allowed worker satisfying the task's capability tier, work class, repository policy, required tools, availability, and configured budget.
-- [ ] **ORCH-147** Implement structured escalation packets. Before moving a task to a higher capability tier, preserve at least:
-  - the original question/acceptance criteria;
-  - confirmed facts and collected evidence;
-  - commands/tests already run and their important results;
-  - attempted hypotheses/fixes and why they failed;
-  - relevant logs, traces, diffs, artifacts, or research notes;
-  - the specific unresolved question the higher tier should attack.
-- [ ] **ORCH-148** Implement bounded escalation and step-down policy:
-  - do not escalate merely because a task is large;
-  - require evidence-producing attempts or an explicit research-class trigger;
-  - respect `max_capability_tier` and human approval/budget gates;
-  - after a Tier 4 research run resolves the unknown, route ordinary implementation/tests/docs back to Tier 2 or Tier 1 instead of leaving the premium model attached indefinitely.
-- [ ] **ORCH-149** Add routing regression tests covering at least:
-  - Tier 1 routine work stays on Tier 1;
-  - Tier 2 receives normal serious engineering work;
-  - repeated evidence-producing Tier 2 failures can promote to Tier 3;
-  - research-class/undocumented-system work can reach Tier 4 under policy;
-  - provider outage selects an allowed equivalent/fallback without corrupting task state;
-  - budget caps and human-approval requirements block unauthorized premium escalation;
-  - a resolved Tier 4 research task steps back down for implementation;
-  - capability tier never grants broader repository, secret, hardware, merge, or authorization permissions.
+- [ ] **ORCH-144** Extend task/run metadata and handoff schema with provider-neutral routing fields (`work_class`, `capability_tier`, max/fallback tier, evidence packet, budget/approval requirements).
+- [ ] **ORCH-145** Add a configurable model/worker registry mapping capability tiers to available providers, models, harnesses, tools, and cost policy.
+- [ ] **ORCH-146** Implement deterministic cheapest-capable routing subject to task capability, repo policy, required tools, availability, and budget.
+- [ ] **ORCH-147** Preserve structured evidence packets before escalation: original goal, confirmed facts, commands/tests, failed hypotheses, logs/diffs/artifacts, and the specific unresolved question.
+- [ ] **ORCH-148** Implement bounded escalation + step-down. Premium research resolves the unknown; routine implementation returns to cheaper tiers.
+- [ ] **ORCH-149** Add routing regressions for tier selection, promotion, research triggers, provider outage/fallback, budget/approval gates, step-down, and invariant permission boundaries.
 
 ### M3 exit criteria
 
@@ -380,7 +342,7 @@ One real DualDex issue can move from authorized plan → implementation → revi
 
 At least one controlled pilot task can also be classified and routed through the capability ladder with a durable evidence packet, deterministic escalation/step-down behavior, and no provider/model name acting as the source of truth for task state.
 
-**GATE:** do not enable automatic premium-model escalation until routing tests, budget limits, evidence handoffs, and any required human approval gates have been exercised deliberately.
+**GATE:** do not enable automatic premium-model escalation until routing tests, budget limits, evidence handoffs, and required human approval gates have been exercised deliberately.
 
 ---
 
@@ -402,7 +364,7 @@ At least one controlled pilot task can also be classified and routed through the
 - [ ] **ORCH-156** Add DeepSeek Harness as an optional specialist worker, not the state owner.
 - [ ] **ORCH-157** Test parallel root-cause investigation on a known hard bug.
 - [ ] **ORCH-158** Test multi-agent review/research without granting extra merge authority.
-- [ ] **ORCH-159** Measure whether swarm runs produce better results than a single Codex debugging pass.
+- [ ] **ORCH-159** Measure whether swarm runs produce better results than a single senior debugging pass.
 
 ## M4.3 — Remote operations
 
@@ -419,26 +381,11 @@ At least one controlled pilot task can also be classified and routed through the
 
 ## M4.5 — Model usage & capacity hub
 
-**Goal:** give humans and the capability-tier router one normalized, near-real-time view of which model capacity is actually available. See [`MODEL_USAGE_HUB.md`](MODEL_USAGE_HUB.md) for the design.
+**Goal:** give humans and the capability-tier router one normalized, near-real-time view of which model capacity is actually available. See [`MODEL_USAGE_HUB.md`](MODEL_USAGE_HUB.md).
 
-- [ ] **ORCH-167** Build provider-capacity adapters and a normalized capacity snapshot schema covering configured models/workers. Capture authoritative quota/usage when providers expose it, plus availability, rate-limit state, reset windows, billing/budget data when useful, and provenance fields such as `observed_at`, freshness, source, and quality. Where exact quota is unavailable, support clearly labeled derived/estimated/manual values instead of inventing precision.
-- [ ] **ORCH-168** Build the human-facing usage hub and persistence layer:
-  - current availability/capacity grouped by capability tier;
-  - remaining quota/usage and reset countdowns where known;
-  - rate-limit state;
-  - current task/run reservations;
-  - usage history by model, repo, task, and work class;
-  - configured budget/reserve thresholds;
-  - stale/failed telemetry warnings;
-  - concise alerts when premium capacity is low, providers become unavailable, or quota resets make blocked work runnable again.
-- [ ] **ORCH-169** Integrate capacity into deterministic routing policy:
-  - prefer the cheapest capable worker that also has sufficient fresh capacity;
-  - protect configurable Tier 3/Tier 4 reserve thresholds;
-  - never silently downgrade below required capability just to save quota;
-  - queue/block or require human approval when no eligible worker has enough capacity;
-  - add short-lived capacity reservations so concurrent tasks do not all spend the same apparent remaining quota;
-  - treat stale/unknown usage as uncertainty rather than as an exact remaining percentage;
-  - add regression tests proving capacity affects worker selection but never expands repository, secret, hardware, merge, or authorization permissions.
+- [ ] **ORCH-167** Build provider-capacity adapters + normalized capacity snapshots with provenance/freshness and no fabricated quota precision.
+- [ ] **ORCH-168** Build the human-facing usage hub/persistence layer for availability, quota/reset state, rate limits, active reservations, usage history, budgets/reserves, and stale telemetry warnings.
+- [ ] **ORCH-169** Integrate capacity into deterministic routing without weakening capability/security requirements; add capacity-aware routing regressions.
 
 ### M4 exit criteria
 
@@ -461,8 +408,8 @@ The operations layer provides a trustworthy view of active work and configured m
 ## M5.2 — Dungeon Dispatcher
 
 - [ ] **ORCH-175** Add Dungeon Dispatcher after the game prototype has a proven core loop.
-- [ ] **ORCH-176** Let agents own plumbing/tooling/tests/data structure work.
-- [ ] **ORCH-177** Keep "is this fun?" and core game-design decisions human-controlled.
+- [ ] **ORCH-176** Let agents own plumbing/tooling/tests/data-structure work.
+- [ ] **ORCH-177** Keep `is this fun?` and core game-design decisions human-controlled.
 - [ ] **ORCH-178** Configure `#dungeon-dispatcher` only when active development begins.
 
 ---
@@ -487,17 +434,17 @@ Until all of these exist, **agent-authored changes require a human merge**.
 
 # Immediate next 10 tasks
 
-If starting today, do these in order:
+Starting from the current post-M2.2 state:
 
-1. [ ] **ORCH-001** Finish/stabilize the Sonoran Solutions GitHub identity rename.
-2. [ ] **ORCH-005** Choose one small real DualDex pilot issue.
-3. [ ] **ORCH-011** Run the Codex planning pass manually.
-4. [ ] **ORCH-014** Implement it with human-steered Antigravity.
-5. [ ] **ORCH-016** Have Codex review the resulting diff.
-6. [ ] **ORCH-034** Lock the minimal Slack notification policy.
-7. [ ] **ORCH-037** Move orchestration secrets/config outside task worktrees.
-8. [ ] **ORCH-058** Replace unsafe shell-string router dispatch.
-9. [ ] **ORCH-067** Add SQLite task/run/delivery/lease state.
-10. [ ] **ORCH-077** Add isolated per-task git worktrees.
+1. [ ] **Housekeeping:** add minimal GitHub Actions for the Orchestrator's portable router tests and prove it with a harmless PR.
+2. [ ] **M2.3 prerequisite:** create a dedicated, budget-limited Hermes inference credential and wire it only into the repair sandbox.
+3. [ ] **ORCH-100:** run the first real Hermes repair against a deliberately trivial compile/syntax failure.
+4. [ ] **ORCH-101:** run a narrow failing-unit-test repair.
+5. [ ] **ORCH-102:** prove a repair that worsens tests is not accepted and the next attempt starts clean.
+6. [ ] **ORCH-103:** prove a behavior/API decision escalates rather than being guessed.
+7. [ ] **ORCH-104:** prove three failed repair attempts stop the loop and attempt 4 never launches.
+8. [ ] **ORCH-105:** prove GitHub Actions remains authoritative when Hermes passes locally but required CI fails.
+9. [ ] **M2.4 / ORCH-080 + ORCH-106–110:** implement router-owned candidate publication, senior review, CI gating, retention/GC, and human-only merge.
+10. [ ] **Evaluation Gate / ORCH-120–125:** compare M0 vs M2 and decide whether the system has earned M3.
 
-Only after those basics are healthy should Hermes receive unattended repair work.
+Do not begin M3 until the Evaluation Gate says the workflow is genuinely worth keeping.
